@@ -1,5 +1,3 @@
 {
-  "ty.diagnosticMode": "off",
-  "ty.inlayHints.variableTypes": false,
-  "ty.inlayHints.callArgumentNames": false
+  "editor.inlayHints.enabled": "off"
 }
