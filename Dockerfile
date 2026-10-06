@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SDL_VIDEODRIVER=dummy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git libgl1 libglib2.0-0 \
+    git libgl1 libglib2.0-0 openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
@@ -21,3 +21,8 @@ RUN useradd --create-home --shell /bin/bash vscode \
     && chown vscode:vscode /workspace
 COPY --chown=vscode:vscode . /workspace
 USER vscode
+
+# Let `uv run` in the container use the image's Python, never a host `.venv`
+# that the bind mount brings into /workspace.
+ENV UV_PROJECT_ENVIRONMENT=/usr/local \
+    UV_NO_SYNC=1

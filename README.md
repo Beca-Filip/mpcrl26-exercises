@@ -13,7 +13,9 @@ Choose one of the two setup routes below.
 
 **Requirements:** [Git](https://git-scm.com/install/), [Python](https://www.python.org/downloads/) (3.11 recommended), and [uv](https://docs.astral.sh/uv/getting-started/installation/) or pip.
 
-1. Clone this repository and open a terminal in its root directory.
+1. Clone this repository with
+   `git clone https://github.com/mpcrl-school/mpcrl26-exercises.git`
+   and open a terminal in its root directory.
 2. Install the dependencies and start the marimo editor:
 
    ```bash
@@ -59,9 +61,9 @@ but does not install Git itself.
    in the Command Palette) and enter `https://github.com/mpcrl-school/mpcrl26-exercises.git`.
 2. Open the cloned folder and start Docker Desktop.
 3. Select **Dev Containers: Reopen in Container** and wait for the build to finish.
-4. Open a released exercise with **marimo: Open as marimo notebook**, using the
-   container's Python environment. The first time, the marimo extension can
-   take a minute to load.
+4. Open a released exercise with **marimo: Open as marimo notebook** and select
+   the kernel **Python 3.11** (`/usr/local/bin/python`). The first time, the marimo
+   extension can take a minute to load.
 
 The Dev Container installs Python and the dependencies using the root
 `Dockerfile`, and adds the Python, marimo and ty extensions automatically.
