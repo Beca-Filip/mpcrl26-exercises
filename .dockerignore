@@ -1,0 +1,9 @@
+.git
+.DS_Store
+.direnv
+.venv
+__marimo__
+__pycache__
+output
+*.pyc
+*.egg-info
