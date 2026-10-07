@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 
@@ -55,8 +55,8 @@ def _(ca):
     u = ca.SX.sym("u")
 
     def vector_field(s, u):
-        theta_dot = ...  # TODO: angle derivative.
-        omega_dot = ...  # TODO: angular acceleration.
+        theta_dot = s[1]  # TODO: angle derivative.
+        omega_dot = ca.sin(s[0]) + u  # TODO: angular acceleration.
         return ca.vertcat(theta_dot, omega_dot)
 
     return s, u, vector_field
@@ -85,7 +85,7 @@ def _(f, np):
     print("Return type:", type(rate), "shape:", rate.shape)
     print("As a NumPy array:", np.asarray(rate))
     rate
-    return probe_input, probe_state, rate
+    return probe_input, probe_state
 
 
 @app.cell(hide_code=True)
@@ -120,10 +120,10 @@ def _(ca, vector_field):
         for _ in range(substeps):
             # The input is held constant throughout all four slope evaluations.
             k1 = f(x, u)
-            k2 = ...  # TODO: slope at the first midpoint estimate.
-            k3 = ...  # TODO: slope at the second midpoint estimate.
-            k4 = ...  # TODO: slope at the endpoint estimate.
-            x = ...  # TODO: weighted RK4 update.
+            k2 = f(x + h*k1/2, u)  # TODO: slope at the first midpoint estimate.
+            k3 = f(x + h*k2/2, u)  # TODO: slope at the second midpoint estimate.
+            k4 = f(x + h*k3, u)  # TODO: slope at the endpoint estimate.
+            x = x + h * (k1 + 2*k2 + 2*k3 + k4) / 6  # TODO: weighted RK4 update.
         return x
 
     return (rk4,)
@@ -145,7 +145,7 @@ def _(F, np, probe_input, probe_state):
     print("Initial state:", probe_state)
     print("State after one interval:", next_state)
     next_state
-    return (next_state,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -167,8 +167,8 @@ def _(mo):
 @app.cell
 def _(ca):
     def jacobians(s, u, expression):
-        A = ...  # TODO: ca.jacobian with respect to the state.
-        B = ...  # TODO: ca.jacobian with respect to the input.
+        A = ca.jacobian(expression, s)  # TODO: ca.jacobian with respect to the state.
+        B = ca.jacobian(expression, u)  # TODO: ca.jacobian with respect to the input.
         return ca.Function("A", [s, u], [A]), ca.Function("B", [s, u], [B])
 
     return (jacobians,)
@@ -241,7 +241,7 @@ def _(Ac0, Ad, Bc0, Bd, dt, np):
     print("Bd at the equilibrium:\n", Bd0)
     print("First-order approximation I + dt*Ac:\n", np.eye(2) + dt * Ac0)
     print("First-order approximation dt*Bc:\n", dt * Bc0)
-    return Ad0, Bd0
+    return
 
 
 @app.cell(hide_code=True)
@@ -264,7 +264,7 @@ def _(np):
         states[0] = initial_state
         for k, action in enumerate(inputs):
             # Numerical CasADi outputs are DM matrices; store a flat NumPy state.
-            next_state = ...  # TODO: evaluate the transition at states[k], action.
+            next_state = transition(states[k], action)  # TODO: evaluate the transition at states[k], action.
             states[k + 1] = np.asarray(next_state).ravel()
         return states
 
@@ -309,6 +309,67 @@ def _(mo):
     Run the simulation again and compare it with the first result.
     What has changed?
     """)
+    return
+
+
+@app.cell
+def _(ca, dt, s, substeps, u):
+    def vector_field_friction(s, u, b=0.1):
+        theta_dot = s[1]  # TODO: angle derivative.
+        omega_dot = ca.sin(s[0]) - b * s[1] + u  # TODO: angular acceleration.
+        return ca.vertcat(theta_dot, omega_dot)
+
+    def rk4_friction(s, u, dt, substeps=5):
+        f = ca.Function("f", [s, u], [vector_field_friction(s, u)])
+        h = dt / substeps
+        x = s
+        for _ in range(substeps):
+            # The input is held constant throughout all four slope evaluations.
+            k1 = f(x, u)
+            k2 = f(x + h*k1/2, u)  # TODO: slope at the first midpoint estimate.
+            k3 = f(x + h*k2/2, u)  # TODO: slope at the second midpoint estimate.
+            k4 = f(x + h*k3, u)  # TODO: slope at the endpoint estimate.
+            x = x + h * (k1 + 2*k2 + 2*k3 + k4) / 6  # TODO: weighted RK4 update.
+        return x
+
+    dt_friction = 0.1
+    substeps_friction = 5
+    discrete_dynamics_friction = rk4_friction(s, u, dt, substeps)
+    F_friction = ca.Function("F", [s, u], [discrete_dynamics_friction])
+    F_friction
+    return (F_friction,)
+
+
+@app.cell
+def _(mo):
+    run_friction = mo.ui.run_button(label="Simulate")
+    run_friction
+    return (run_friction,)
+
+
+@app.cell
+def _(F_friction, dt, mo, np, run_friction, simulate, states):
+    mo.stop(not run_friction.value)
+    states_friction = simulate(F_friction, [np.pi / 2, 0], np.zeros(200))
+    time_friction = np.arange(len(states)) * dt
+    print("Trajectory shape:", states_friction.shape)
+    states[:5]
+    return states_friction, time_friction
+
+
+@app.cell
+def _(plt, states_friction, time_friction):
+    fig_friction, axes_friction = plt.subplots(2, 1, sharex=True, figsize=(8, 5))
+    axes_friction[0].plot(time_friction, states_friction[:, 0]); axes_friction[0].set_ylabel("Angle")
+    axes_friction[1].plot(time_friction, states_friction[:, 1]); axes_friction[1].set_ylabel("Angular velocity")
+    axes_friction[1].set_xlabel("Time")
+    fig_friction.tight_layout()
+    fig_friction
+    return
+
+
+@app.cell
+def _():
     return
 
 
