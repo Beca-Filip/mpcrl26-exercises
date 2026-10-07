@@ -1,0 +1,144 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[top=4.5cm, bottom=2cm, left=2cm, right=2cm, headheight=4.5cm]{geometry}
+\usepackage{background}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{calc}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumerate}
+\usepackage{enumitem}
+\usepackage{pdfpages}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{cleveref}
+\usepackage{svg}
+\usepackage{stackrel}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{listings}
+\newcommand{\acados}{\texttt{acados}}
+\newcommand{\leapc}{\texttt{leap-c}}
+
+% \usepackage[framed,numbered,autolinebreaks,useliterate]{mcode}
+\usepackage[short]{optidef}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+
+\backgroundsetup{
+  scale=1,
+  opacity=0.7, % Adjust the opacity as needed
+%   position={2cm, 0cm},
+  placement=top,
+  contents={\includegraphics[trim=0 3.0cm 0 0, clip, width=\textwidth]{img/title.png}}  % Adjust the width as needed}
+}
+
+\pagestyle{fancy}
+\fancyhf{}  % Clear the existing header and footer settings
+\chead{
+	\begin{center}
+		{\Large
+		\textsc{Model Predictive Control and Reinforcement Learning}\\
+		\vspace*{0.3cm}
+		Exercise Sheet 2: Introduction to \acados{} and \leapc{} in \texttt{Python}}
+	\end{center}
+	\hfill{\small Joschka Boedecker, Moritz Diehl, Leonard Fichtner, Jonathan Frey, Andrea Ghezzi, Jasper Hoffmann}
+}
+\rfoot{\thepage}
+
+%opening
+\begin{document}
+
+
+
+\section*{Exercise 1: Getting started with \acados{}}
+In this exercise, you will implement a simple MPC controller for the Cart Pole environment
+(aka inverted pendulum on a cart), see Figure \ref{cartpole}.
+The goal is to implement a controller that balances the pole in the closed-loop simulation provided in \verb*|example_closed_loop.py|.
+
+\begin{figure}[ht!]
+\center
+\includegraphics[width=0.7\textwidth]{img/cartpole.png}
+\caption{An illustration of Cart Pole while swinging up.}
+\label{cartpole}
+\end{figure}
+
+
+\begin{enumerate}[label=1.\arabic*]
+	\item Familiarize yourself with the \href{https://github.com/leap-c/leap-c/blob/main/leap_c/examples/cartpole/env.py#L24}{\texttt{CartPoleEnv}} environment, e.g., by reading the documentation of the class.
+	\item Complete the controller formulation in the function \verb*|setup_ocp| provided in \verb*|setup_ocp.py|.
+	For a given initial state $s$, this function formulates a simple MPC controller described by the problem formulation
+	\begin{align*}
+    \min_{\substack{x_0, u_0, x_1,...,u_{N-1},x_N}} & \frac{1}{N}\sum_{k=0}^{N-1} l(x_k, u_k) + \overline{V}(x_N)\\
+                                                   \text{s.t. } & x_0 = s\\
+                                                    & x_{k+1} = f^{\mathrm{dyn}}(x_k, u_k),\ k = 0,...,N-1\\
+                                                    & \underline{u} \leq u_k \leq \overline{u},\ k = 0,...,N-1,
+	\end{align*}
+	where $f^{\mathrm{dyn}}(x_k, u_k)$ are the dynamics of the Cart Pole system, given by one step of an RK4 integrator, $\underline{u}$ and
+	$\overline{u}$ are the actuator limits, and the stage costs and terminal cost are given by
+	\begin{equation*} l(x_k, u_k)= \frac{1}{2}||\begin{pmatrix}x_k\\u_k\end{pmatrix}-\begin{pmatrix}x^{\mathrm{ref}}\\u^\mathrm{ref}\end{pmatrix}||_{W}^2\end{equation*}
+	and
+	\begin{equation*} \overline{V}(x_N)= \frac{1}{2}||x_N-x_{\mathrm{e}}^\mathrm{ref}||_{W_{\mathrm{e}}}^2 .\end{equation*}
+
+	Set the values of $x^{\mathrm{ref}}, u^{\mathrm{ref}}, x^{\mathrm{ref}}_{\mathrm{e}}, W, W_\mathrm{e}$ in a way that the controller successfully balances the pole.
+	This will be indicated by messages printed by \verb*|example_closed_loop.py|.
+	This will also generate plots and a rendered video that might be helpful.
+\end{enumerate}
+
+
+\section*{Exercise 2: Parametric sensitivities}
+In this exercise, we show how to extend the \acados{} formulation from the previous exercise step-by-step,
+to arrive at a \leapc{} controller that can be used to train parameters with one of the
+\leapc{} algorithms and \texttt{PyTorch} in general. As an example, we will
+use this formulation to solve MPC problems for varying values for the reference of the angle $\theta$
+and compute their sensitivities in \verb*|example_diffMPC.py|.
+
+\begin{enumerate}[label=2.\arabic*]
+	\item Make yourself familiar with the
+	\verb*|AcadosParameterManager| class.
+	\item The goal now is to make a modified version of \verb*|setup_ocp|,
+	in which the parameter manager class is used to introduce new parameters into the
+	acados ocp formulation.\\
+	At the bottom of \verb*|setup_ocp_with_manager.py| you will find a method
+	\verb*|create_cartpole_params| which returns a list of \verb*|AcadosParameters| to
+	be passed to the \verb*|AcadosParameterManager| instance at creation.
+	As an example, it already contains instances meant for the weight matrix.
+	Extend this list to also contain 5 more \texttt{AcadosParameter}s, one for each field in the
+	reference part of the cost.
+	Make only the reference of the angle~$\theta$ learnable.
+	\item Now complete the function \verb*|setup_ocp_with_manager|
+	in \verb*|setup_ocp_with_manager.py|.
+	\item Familiarize yourself with \verb*|AcadosDiffMpcTorch| and \\
+	\verb*|AcadosController|.
+	Create an \verb*|AcadosController| in \verb*|example_diffMPC.py|.
+	Make sure to set \verb*|n_batch_max| of the \verb*|AcadosDiffMpcTorch| high enough
+	such that the batch of parameters \verb*|p_values| can be passed.
+	\item Run \verb*|example_diffMPC.py| to solve a batch
+	of optimization problems with varying reference of the angle and compute their sensitivities.
+	Think about what these plots say in the context of learning approaches aiming to leverage the sensitivities.
+	\item (Bonus) Feel free to play around with values of the parameters, ocp formulations,
+	calculating other sensitivities, or making parameters differ over the horizon 
+	(field \verb*|end_stages| for the \verb|AcadosParameter|).
+	Note that while playing around, it will likely happen, that the solver will not converge for some of the parameters you will throw at him.
+	Therefore, you might want to adjust your ocp formulation (e.g., adjust ``solver\_options'', adjust fixed values, slack constraints),
+	adjust the sampled parameters (e.g., their range), 
+	or just ignore it and filter the non-converged samples for whatever you want to do (e.g., plotting).
+
+\end{enumerate}
+
+\subsection*{Useful Resources}
+\begin{itemize}
+	\item \href{https://github.com/acados/acados/blob/master/docs/problem_formulation/problem_formulation_ocp_mex.pdf}{\acados{} problem formulation PDF}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/examples/cartpole/env.py#L24}{\texttt{CartPoleEnv}}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/ocp/acados/parameters.py#L15}{\texttt{AcadosParameters}}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/ocp/acados/parameters.py#L70}{\texttt{AcadosParameterManager}}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/ocp/acados/torch.py#L18}{\texttt{AcadosDiffMpcTorch}}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/ocp/acados/diff_mpc.py#L30}{\texttt{AcadosDiffMpcCtx}}
+	\item \href{https://github.com/leap-c/leap-c/blob/main/leap_c/ocp/acados/controller.py#L13}{\texttt{AcadosController}}
+\end{itemize}
+
+
+%\section*{Bonus exercises}
+
+\end{document}
+
