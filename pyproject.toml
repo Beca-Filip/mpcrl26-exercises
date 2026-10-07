@@ -7,7 +7,7 @@ name = "mpcrl26-exercises"
 version = "0.1.0"
 description = "Python environment for the 2026 MPC and RL school exercises"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "casadi>=3.6,<4",
     "gymnasium[classic-control,toy-text]>=1.0,<2",
