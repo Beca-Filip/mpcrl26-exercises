@@ -8,503 +8,490 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import casadi as ca
+    import matplotlib.pyplot as plt
     import numpy as np
-    from utils import plot_nlp, plot_ocp
+    from scipy.linalg import solve_discrete_are
+    from scipy.interpolate import RegularGridInterpolator
+    from utils import plot_comparison, plot_slices
 
-    return ca, mo, np, plot_nlp, plot_ocp
+    return (
+        RegularGridInterpolator,
+        ca,
+        mo,
+        np,
+        plot_comparison,
+        plot_slices,
+        plt,
+        solve_discrete_are,
+    )
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # Exercise 02 — Numerical optimization and optimal control
+    # Exercise 03 — Value iteration and LQR
 
-    **Goal:** use CasADi to formulate, differentiate, and solve constrained
-    optimization problems, then apply these tools to pendulum swing-up.
+    In Exercise 02 you solved an OCP for a single initial state. Here we
+    compute **policies** that return a torque for every state, once with LQR
+    and once with value iteration, and compare them.
 
-    ## 1. Derivatives and KKT conditions
-    The following problem combines a nonlinear objective with a curved feasible set:
+    ### Setup
+    We use the pendulum from Exercise 01, $\dot\theta=\omega$,
+    $\dot\omega=\sin\theta+u$, with state $s=(\theta,\omega)$ and torque $u$.
+    The upright target is $(0,0)$; the hanging state is $(\pi,0)$. RK4 with
+    $\Delta t=0.1$ gives the discrete-time dynamics $s_{k+1}=f(s_k,u_k)$, and
+    we use the **discrete-time** stage cost
 
     $$
-    \begin{aligned}
-    \min_{x,y}\quad &f(x,y)=\tfrac12(x-1)^2+50(y-x^2)^2+\tfrac12x^2,\\
-    \text{s.t.}\quad &g(x,y)=x+(1-y)^2=0.
-    \end{aligned}
+    \ell(s,u)=s^\top Qs+Ru^2,\qquad Q=\operatorname{diag}(100,0.01),\quad R=0.001.
     $$
 
-    **Task — Derivatives:** derive the gradients and Hessians of $f$ and $g$ on paper.
-
-    **Task — KKT conditions:** write out the KKT equations for $L=f+\lambda g$;
-    are these conditions necessary for optimality, and are they sufficient?
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Derivatives.**
-
-    $$
-    \nabla f=\begin{bmatrix}2x-1-200x(y-x^2)\\100(y-x^2)\end{bmatrix},
-    \qquad\nabla g=\begin{bmatrix}1\\2(y-1)\end{bmatrix}.
-    $$
-
-    $$
-    \nabla^2 f=\begin{bmatrix}2-200y+600x^2&-200x\\-200x&100\end{bmatrix},
-    \qquad\nabla^2 g=\begin{bmatrix}0&0\\0&2\end{bmatrix}.
-    $$
-
-    **KKT conditions.** Feasibility and stationarity give
-
-    $$
-    \begin{aligned}
-    x+(1-y)^2&=0,\\
-    2x-1-200x(y-x^2)+\lambda&=0,\\
-    100(y-x^2)+2\lambda(y-1)&=0.
-    \end{aligned}
-    $$
-
-    The **linear independence constraint qualification (LICQ)** holds because
-    the single equality-constraint gradient $\nabla g=(1,2(y-1))^T$ never vanishes,
-    so the KKT equations are necessary at a local minimum. They are not sufficient
-    to guarantee a minimum in this nonconvex problem; second-order optimality
-    conditions are covered in the lecture.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    We now move from the pen-and-paper calculations to CasADi code.
-
-    **Task:** define the objective `f` and constraint `g` as `SX` expressions;
-    see CasADi's [SX symbolics documentation](https://web.casadi.org/docs/#the-sx-symbolics).
+    ## 1. LQR
+    The helper `linear_model` differentiates the discretized dynamics $f$ at the
+    upright equilibrium, which gives the linear model $s_{k+1}\approx As_k+Bu_k$.
     """)
     return
 
 
 @app.cell
-def _(ca):
-    z = ca.SX.sym("z", 2)
-    x, y = z[0], z[1]
-    f = 0.5 * (x - 1)**2 + 50 * (y - x**2)**2 + 0.5 * x**2  # Scalar objective expression.
-    g = x + (1 - y)**2  # Scalar equality-constraint expression.
-    print("Objective expression:", f)
-    print("Constraint expression:", g)
-    return f, g, x, y, z
+def _(ca, np):
+    def transition(states, actions, dt=0.1):
+        # The last axis holds (theta, omega); leading axes may hold a whole grid.
+        x = np.asarray(states, dtype=float).copy()
+        actions = np.broadcast_to(actions, x.shape[:-1])
 
+        def f(s):
+            return np.stack((s[..., 1], np.sin(s[..., 0]) + actions), axis=-1)
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Task:** wrap `f` and `g` in CasADi `Function` objects for numerical evaluation.
-    """)
-    return
-
-
-@app.cell
-def _(ca, f, g, z):
-    objective = ca.Function("objective", [z], [f])  # Function with input z and output f.
-    constraint = ca.Function("constraint", [z], [g])  # Function with input z and output g.
-    print(objective)
-    print(constraint)
-    return constraint, objective
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    Evaluating the objective and constraint at `initial_guess` returns CasADi `DM` objects.
-    """)
-    return
-
-
-@app.cell
-def _(constraint, np, objective):
-    initial_guess = np.array([0.0, 0.0])
-    print("f(z):", objective(initial_guess))
-    print("g(z):", constraint(initial_guess))
-    return (initial_guess,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Task:** generate the gradient and Hessian expressions with CasADi; `derivatives` collects them as named outputs.
-    See CasADi's [differentiation documentation](https://web.casadi.org/docs/#calculus-algorithmic-differentiation) for `gradient` and `hessian`.
-    """)
-    return
-
-
-@app.cell
-def _(ca, f, g, z):
-    grad_f = ca.gradient(f, z)  # Gradient of f with respect to z.
-    grad_g = ca.gradient(g, z)  # Gradient of g with respect to z.
-    hess_f = ca.hessian(f, z)[0]  # Hessian of f; ca.hessian returns (Hessian, gradient).
-    hess_g = ca.hessian(g, z)[0]  # Hessian of g.
-    derivatives = ca.Function("derivatives", [z], [grad_f, grad_g, hess_f, hess_g],
-                              ["z"], ["grad_f", "grad_g", "hess_f", "hess_g"])
-    derivatives
-    return derivatives, grad_f, grad_g, hess_f, hess_g
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    The gradients and Hessians at `initial_guess` are returned as `DM` matrices.
-    """)
-    return
-
-
-@app.cell
-def _(derivatives, initial_guess):
-    # Named outputs make it clear which derivative each matrix represents.
-    derivative_values = derivatives(z=initial_guess)
-    for _name, _value in derivative_values.items():
-        print(f"{_name}:\n{_value}")
-    return (derivative_values,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    `nlpsol` creates an IPOPT solver represented by a CasADi `Function`.
-    **Task:** construct `solver` for the problem dictionary `nlp` using `ca.nlpsol`.
-    """)
-    return
-
-
-@app.cell
-def _(ca, f, g, z):
-    nlp = {"x": z, "f": f, "g": g}
-    solver = ca.nlpsol("nlp", "ipopt", nlp, {"ipopt.print_level": 0, "print_time": False})  # IPOPT solver for nlp.
-    solver
-    return nlp, solver
-
-
-@app.cell
-def _(mo):
-    solve_small = mo.ui.run_button(label="Solve the constrained NLP")
-    solve_small
-    return (solve_small,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    Calling the solver with an initial guess and equality bounds returns a dictionary of `DM` results.
-    **Task:** set `lbg` and `ubg` to enforce the equality constraint.
-    """)
-    return
-
-
-@app.cell
-def _(initial_guess, mo, solve_small, solver):
-    mo.stop(not solve_small.value)
-    # Equal lower and upper constraint bounds enforce g(z) = 0.
-    result = solver(x0=initial_guess, lbg=0, ubg=0)  # Equality bounds.
-    print("Result keys:", list(result))
-    print("Solver status:", solver.stats()["return_status"])
-    result
-    return (result,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    The solver result contains the optimal variables, objective value, and equality-constraint multiplier.
-    **Task:** extract `z_star` and `lambda_star` from the result dictionary.
-    """)
-    return
-
-
-@app.cell
-def _(result):
-    z_star = result["x"]  # Optimal primal variables.
-    lambda_star = result["lam_g"]  # Equality-constraint multiplier.
-    print("Primal solution:", z_star)
-    print("Objective value:", result["f"])
-    print("Constraint multiplier:", lambda_star)
-    return lambda_star, z_star
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Task:** complete `stationarity` using the symbolic multiplier `lam` to obtain the KKT residual function.
-    """)
-    return
-
-
-@app.cell
-def _(ca, f, g, z):
-    lam = ca.SX.sym("lam")
-    stationarity = ca.gradient(f + lam * g, z)  # Gradient of the Lagrangian f + lam*g.
-    kkt = ca.Function("kkt", [z, lam], [g, stationarity],
-                      ["z", "lam"], ["feasibility", "stationarity"])
-    kkt
-    return kkt, lam, stationarity
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    The KKT residuals evaluated at the primal and dual solution should both be close to zero.
-    """)
-    return
-
-
-@app.cell
-def _(kkt, lambda_star, z_star):
-    residuals = kkt(z=z_star, lam=lambda_star)
-    print("Feasibility residual:", residuals["feasibility"])
-    print("Stationarity residual:\n", residuals["stationarity"])
-    return (residuals,)
-
-
-@app.cell
-def _(plot_nlp, z_star):
-    plot_nlp(z_star)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## 2. Pendulum swing-up by multiple shooting
-    Use Exercise 01's dynamics to move the pendulum from its hanging state
-    $(-\pi,0)$ toward the upright target $(0,0)$ with bounded torque.
-
-    $$
-    \begin{aligned}
-    \min_{s_0,u_0,\ldots,s_N}\quad &
-    \frac{\Delta t}{2}\sum_{k=0}^{N-1}(s_k^TQs_k+u_k^2)+\frac12s_N^TQs_N\\
-    \text{s.t.}\quad&s_0=(-\pi,0),\quad s_{k+1}=F(s_k,u_k),\\
-    &-1\leq u_k\leq1,\quad -\pi\leq\theta_k\leq2\pi.
-    \end{aligned}
-    $$
-
-    Use $N=200$, $\Delta t=0.05$, $Q=\operatorname{diag}(10,1)$; angular
-    velocity is unconstrained. The lower angle bound $-\pi$ keeps the hanging
-    initial state admissible.
-    Introduce state and input variables, enforce dynamics with shooting
-    equalities, and add stage and terminal costs before solving with IPOPT.
-
-    See CasADi's [Opti documentation](https://web.casadi.org/docs/#opti-stack).
-    """)
-    return
-
-
-@app.cell
-def _(ca):
-    def pendulum_step(state, action, dt):
-        def f(x):
-            return ca.vertcat(x[1], ca.sin(x[0]) + action)
-
-        # Reuse Exercise 01's RK4 scheme with five substeps per control interval.
         h = dt / 5
         for _ in range(5):
-            k1 = f(state)
-            k2 = f(state + h * k1 / 2)
-            k3 = f(state + h * k2 / 2)
-            k4 = f(state + h * k3)
-            state = state + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
-        return state
+            k1 = f(x)
+            k2 = f(x + h * k1 / 2)
+            k3 = f(x + h * k2 / 2)
+            k4 = f(x + h * k3)
+            x += h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+        return x
 
-    return (pendulum_step,)
+    def linear_model(dt=0.1):
+        s = ca.SX.sym("s", 2)
+        u = ca.SX.sym("u")
 
+        def f(x):
+            return ca.vertcat(x[1], ca.sin(x[0]) + u)
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    The RK4 transition is wrapped in a CasADi `Function` and evaluated for one sampling interval.
-    """)
-    return
+        x = s
+        h = dt / 5
+        for _ in range(5):
+            k1 = f(x)
+            k2 = f(x + h * k1 / 2)
+            k3 = f(x + h * k2 / 2)
+            k4 = f(x + h * k3)
+            x += h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+        # LQR needs Jacobians of the discrete map, not the continuous ODE.
+        jac = ca.Function("jacobians", [s, u], [ca.jacobian(x, s), ca.jacobian(x, u)])
+        A, B = jac([0, 0], 0)
+        return np.asarray(A), np.asarray(B)
 
-
-@app.cell
-def _(ca, pendulum_step):
-    dt = 0.05
-    pendulum_state = ca.SX.sym("s", 2)
-    pendulum_input = ca.SX.sym("u")
-    F = ca.Function("F", [pendulum_state, pendulum_input],
-                    [pendulum_step(pendulum_state, pendulum_input, dt)])
-    F
-    return F, dt, pendulum_input, pendulum_state
-
-
-@app.cell
-def _(F, np):
-    step_probe = F([-np.pi + 0.1, 0], 0)
-    print("State after one interval:", step_probe)
-    return (step_probe,)
+    return linear_model, transition
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    `Opti.variable` creates `MX` state and input variables of shapes `(2,N+1)` and `(1,N)`.
+    As in the lecture, the LQR value function is $V^\star(s)=s^\top Xs$, where
+    $X$ solves the discrete-time algebraic Riccati equation (DARE)
+
+    $$
+    X=Q+A^\top XA-A^\top XB\,(R+B^\top XB)^{-1}B^\top XA.
+    $$
+
+    Solve it with SciPy's
+    [`solve_discrete_are`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.solve_discrete_are.html),
+    then compute the gain
+
+    $$
+    K=(R+B^\top XB)^{-1}B^\top XA,\qquad \mu(s)=-Ks.
+    $$
+
+    Complete `lqr_gain`.
     """)
     return
 
 
 @app.cell
-def _(ca):
-    N = 200
-    Q = ca.diag(ca.DM([10.0, 1.0]))
-    ocp_variables = ca.Opti()
-    X = ocp_variables.variable(2, N + 1)
-    U = ocp_variables.variable(1, N)
-    print("Variable types:", type(X), type(U))
-    print("State shape:", X.shape, "input shape:", U.shape)
-    return N, Q, U, X, ocp_variables
+def _(np, solve_discrete_are):
+    def lqr_gain(A, B, Q, R):
+        X = solve_discrete_are(A, B, Q, R)  # Solution of the DARE.
+        K = np.linalg.solve(R + B.T @ X @ B, B.T @ X @ A)  # Gain for mu(s) = -K s; use np.linalg.solve instead of an explicit inverse.
+        return K, X
+
+    return (lqr_gain,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    **Task:** set `initial_state` for the initial-state equality; an `Opti` copy keeps the preceding stage unchanged.
+    For checking the correctness we print below $K$ and $X$.
+
+    **Excursion:** We further look at the magnitudes of the closed-loop
+    eigenvalues of $A-BK$. For a stabilizing feedback, the eigenvalues of the controlled system should be smaller than $1$, then the system will converge towards $(0, 0)$.
     """)
     return
 
 
 @app.cell
-def _(U, X, ca, np, ocp_variables):
-    ocp_bounds = ocp_variables.copy()
-    initial_state = ca.DM([-np.pi, 0])  # Use a CasADi DM for (-pi, 0).
-    ocp_bounds.subject_to(X[:, 0] == initial_state)
-    ocp_bounds.subject_to(ocp_bounds.bounded(-1, U, 1))
-    ocp_bounds.subject_to(ocp_bounds.bounded(-np.pi, X[0, :], 2 * np.pi))
-    print("Constraint-vector shape:", ocp_bounds.g.shape)
-    return initial_state, ocp_bounds
+def _(linear_model, lqr_gain, np):
+    A, B = linear_model()
+    Q, R = np.diag([100, 0.01]), np.array([[0.001]])
+    K, X = lqr_gain(A, B, Q, R)
+    print("K =", K)
+    print("X =", X)
+    print("|eigenvalues of A - BK|:", np.abs(np.linalg.eigvals(A - B @ K)))
+    return A, B, K, Q, R, X
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    **Task:** complete `_gap` so the shooting equalities link the independent `MX` states through the transition function.
+    In part 3 we clip the LQR torque to $[-10,10]$. Is that clipped policy
+    still the optimal LQR policy?
     """)
     return
-
-
-@app.cell
-def _(F, N, U, X, ocp_bounds):
-    ocp_dynamics = ocp_bounds.copy()
-    shooting_gaps = []
-    for _k in range(N):
-        _next_state = F(X[:, _k], U[0, _k])
-        _gap = X[:, _k + 1] - _next_state  # X[:, _k + 1] minus the integrated next state.
-        ocp_dynamics.subject_to(_gap == 0)
-        shooting_gaps.append(_gap)
-    print("Constraint-vector shape with dynamics:", ocp_dynamics.g.shape)
-    return ocp_dynamics, shooting_gaps
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    **Task:** complete `_stage_cost` and `terminal_cost` to define the scalar `MX` objective `Opti.f`.
+    **Answer:** no. LQR is optimal only for the unconstrained linear model;
+    clipping to $[-10,10]$ removes that guarantee. It still equals the LQR
+    policy wherever $|Ks|\le 10$.
     """)
     return
-
-
-@app.cell
-def _(N, Q, U, X, ca, dt, ocp_dynamics):
-    ocp = ocp_dynamics.copy()
-    cost = 0
-    for _k in range(N):
-        _stage_cost = dt / 2 * (ca.mtimes([X[:, _k].T, Q, X[:, _k]]) + U[0, _k]**2)  # Stage penalty.
-        cost += _stage_cost
-    terminal_cost = ca.mtimes([X[:, -1].T, Q, X[:, -1]]) / 2  # Endpoint penalty, without a dt factor.
-    ocp.minimize(cost + terminal_cost)
-    print("Objective type:", type(ocp.f), "shape:", ocp.f.shape)
-    return cost, ocp, terminal_cost
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    `Opti.set_initial` sets the initial guess, and `Opti.solver` configures IPOPT without solving the problem.
+    ## 2. Value iteration
+    For discretization we split $\theta\in[-\pi/2,2\pi]$ into 101 points, $\omega\in[-8,8]$
+    into 51, and $u\in[-10,10]$ into 21. `make_grid` also precomputes the next
+    states $f(s,u)$ for all grid states and actions; the cell after it shows
+    the array shapes.
     """)
     return
 
 
 @app.cell
-def _(N, U, X, np, ocp):
-    ocp_ready = ocp.copy()
-    # An initial guess need not satisfy the shooting constraints.
-    ocp_ready.set_initial(X[0, :], np.linspace(-np.pi, 0, N + 1))
-    ocp_ready.set_initial(X[1, :], 0)
-    ocp_ready.set_initial(U, 0)
-    ocp_ready.solver("ipopt", {"print_time": False}, {"print_level": 0, "max_iter": 2000})
-    return (ocp_ready,)
+def _(np, transition):
+    def make_grid():
+        grids = (np.linspace(-np.pi / 2, 2 * np.pi, 101), np.linspace(-8, 8, 51))
+        states = np.stack(np.meshgrid(*grids, indexing="ij"), axis=-1)
+        actions = np.linspace(-10, 10, 21)
+        # Precompute all state/action successors once, not in every Bellman update.
+        state_action_grid = np.broadcast_to(states[:, :, None, :], (*states.shape[:2], len(actions), 2))
+        next_states = transition(state_action_grid, actions)
+        return grids, states, actions, next_states
+
+    return (make_grid,)
 
 
 @app.cell
-def _(mo):
-    solve_control = mo.ui.run_button(label="Solve the swing-up OCP")
-    solve_control
-    return (solve_control,)
+def _(make_grid):
+    grids, states, actions, next_states = make_grid()
+    print("states:", states.shape, " actions:", actions.shape, " next states:", next_states.shape)
+    return actions, grids, next_states, states
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    Solving the OCP returns an `OptiSol` object for evaluating expressions at the optimized variables.
+    $V$ is only stored at the grid points, but the next state $f(s,u)$ usually
+    lands between them. `interpolate_future` therefore estimates $V(f(s,u))$
+    from the four neighbouring grid values (bilinear interpolation). Next
+    states outside the grid get a very large value ($10^{12}$), so value
+    iteration avoids them.
+
+    **Note**: This is slightly different to the equations presented in the lecture but improves the performance ;)
     """)
     return
 
 
 @app.cell
-def _(mo, ocp_ready, solve_control):
-    mo.stop(not solve_control.value)
-    control_solution = ocp_ready.solve()
-    print("Solution type:", type(control_solution))
-    return (control_solution,)
+def _(RegularGridInterpolator):
+    def interpolate_future(grids, values, next_states):
+        interpolation = RegularGridInterpolator(grids, values, bounds_error=False, fill_value=1e12)
+        return interpolation(next_states.reshape(-1, 2)).reshape(next_states.shape[:-1])
+
+    return (interpolate_future,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    `OptiSol.value` extracts numerical trajectories and shooting gaps; the largest absolute gap measures dynamics feasibility.
+    Value iteration repeats the optimal Bellman update on all grid states until
+    it converges. Our dynamics are deterministic, so the sum over next states
+    $s'$ from the lecture reduces to $f(s,u)$:
+
+    $$
+    V_{\rm new}(s)=\min_u\big\{\ell(s,u)+\gamma\,V\big(f(s,u)\big)\big\},
+    \qquad
+    \Delta=\max_s\big|V_{\rm new}(s)-V(s)\big|.
+    $$
+
+    Set $V\gets V_{\rm new}$ and repeat until $\Delta<\varepsilon$; for
+    $\gamma<1$, $V$ converges to $V^\star$. Finally, act greedily with respect
+    to $V$:
+
+    $$
+    \mu(s)\in\operatorname*{arg\,min}_u\big\{\ell(s,u)+\gamma\,V\big(f(s,u)\big)\big\}.
+    $$
+
+    Complete `value_iteration`. It starts from $V=0$ and returns the converged
+    values and the greedy policy, both with shape `(101, 51)`, and the number
+    of iterations.
     """)
     return
 
 
 @app.cell
-def _(U, X, ca, control_solution, np, shooting_gaps):
-    states = np.asarray(control_solution.value(X)).T
-    actions = np.asarray(control_solution.value(U)).ravel()
-    gap_values = np.asarray(control_solution.value(ca.vertcat(*shooting_gaps)))
-    print("State trajectory:", states.shape, "input trajectory:", actions.shape)
-    print("Maximum shooting gap:", np.max(np.abs(gap_values)))
-    states[:5]
-    return actions, gap_values, states
+def _(interpolate_future, np):
+    def value_iteration(grids, states, actions, next_states, Q, R, gamma, tolerance=1e-2):
+        stage = np.einsum("...i,ij,...j->...", states, Q, states)[..., None] + R * actions**2  # Stage costs l(s, u) with shape (101, 51, 21): s^T Q s per state plus R u^2 per action.
+        V = np.zeros(states.shape[:-1])
+        for iteration in range(1, 10_000):
+            future = interpolate_future(grids, V, next_states)
+            costs = stage + gamma * future  # l(s, u) + gamma V(f(s, u)) for every state and action.
+            V_new = costs.min(axis=-1)  # Minimize over the action axis.
+            delta = np.abs(V_new - V).max()  # Largest change max_s |V_new(s) - V(s)|.
+            V = V_new
+            if delta < tolerance:
+                break
+        # Greedy policy with respect to the converged V.
+        costs = stage + gamma * interpolate_future(grids, V, next_states)
+        policy = actions[costs.argmin(axis=-1)]
+        return V, policy, iteration
+
+    return (value_iteration,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    Forward simulation of the optimized inputs provides an independent check against the shooting states.
+    We use $\gamma=0.99$ and $\varepsilon=10^{-2}$. The cell below prints the
+    number of iterations and $V$ at the upright and at the hanging state.
     """)
     return
 
 
 @app.cell
-def _(F, actions, np, states):
-    simulated_states = np.empty_like(states)
-    simulated_states[0] = states[0]
-    for _k, _action in enumerate(actions):
-        simulated_states[_k + 1] = np.asarray(F(simulated_states[_k], _action)).ravel()
-    print("Maximum state difference:", np.max(np.abs(simulated_states - states)))
-    return (simulated_states,)
+def _(
+    Q,
+    R,
+    RegularGridInterpolator,
+    actions,
+    grids,
+    next_states,
+    np,
+    states,
+    value_iteration,
+):
+    gamma = 0.99
+    V, policy, iterations = value_iteration(grids, states, actions, next_states, Q, R.item(), gamma)
+    V_interpolated = RegularGridInterpolator(grids, V)
+    print("Converged after", iterations, "iterations")
+    print("V at upright (0, 0):", V_interpolated([[0, 0]])[0])
+    print("V at hanging (pi, 0):", V_interpolated([[np.pi, 0]])[0])
+    return V, gamma, policy
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Why does value iteration need $\gamma<1$, while the LQR uses no discount?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Answer:** for $\gamma<1$ the Bellman update is a contraction, so value
+    iteration converges from any initial $V$. The LQR minimizes the
+    undiscounted cost. Here the difference is small, because the trajectories
+    reach upright within a few seconds.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 3. Compare LQR and value iteration
+    The plots compare the cost-to-go and the policies on the grid. The LQR
+    torque is clipped to $[-10,10]$.
+    """)
+    return
 
 
 @app.cell
-def _(actions, dt, plot_ocp, states):
-    plot_ocp(states, actions, dt)
+def _(K, V, X, grids, np, plot_comparison, policy, states):
+    lqr_value = np.einsum("...i,ij,...j->...", states, X, states)
+    lqr_action = np.clip(-(states @ K.T)[..., 0], -10, 10)
+    plot_comparison(grids, V, policy, lqr_value, lqr_action)
+    return (lqr_value,)
+
+
+@app.cell
+def _(V, grids, lqr_value, plot_slices):
+    plot_slices(grids, V, lqr_value)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Where do the cost-to-go and the policies agree? Why does LQR lose accuracy
+    far from the upright equilibrium?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Answer:** they agree near upright, where the linearization is accurate and
+    the torque bound is inactive. Far from it, $\sin\theta\not\approx\theta$:
+    the quadratic value $s^\top Xs$ misses the nonlinearity, and the linear
+    policy saturates at $\pm10$.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    The cell below simulates both policies in closed loop for 10 s, from a
+    small perturbation $(0.1,0)$ and from the hanging state $(\pi,0)$. The
+    value-iteration policy acts greedily with respect to $V$ at the exact
+    state, not only at grid points.
+    """)
+    return
+
+
+@app.cell
+def _(K, Q, R, V, actions, gamma, grids, interpolate_future, mo, np, plt, transition):
+    def vi_policy(state):
+        # Greedy action at the exact state: evaluate l(s, u) + gamma V(f(s, u)) for all actions.
+        successors = transition(np.broadcast_to(state, (len(actions), 2)), actions)
+        costs = state @ Q @ state + R.item() * actions**2 + gamma * interpolate_future(grids, V, successors)
+        return actions[costs.argmin()]
+
+    def lqr_policy(state):
+        return np.clip(-(K @ state).item(), -10, 10)
+
+    def simulate(policy_function, initial_state, steps=100):
+        trajectory = [np.asarray(initial_state, dtype=float)]
+        for _ in range(steps):
+            trajectory.append(transition(trajectory[-1], policy_function(trajectory[-1])))
+        return np.asarray(trajectory)
+
+    _figures = []
+    for _initial in [(0.1, 0.0), (np.pi, 0.0)]:
+        _fig, _axes = plt.subplots(2, 1, sharex=True, figsize=(8, 5))
+        for _name, _policy in [("Value iteration", vi_policy), ("LQR", lqr_policy)]:
+            _trajectory = simulate(_policy, _initial)
+            _time = 0.1 * np.arange(len(_trajectory))
+            _axes[0].plot(_time, _trajectory[:, 0], label=_name)
+            _axes[1].plot(_time, _trajectory[:, 1])
+        _axes[0].set(title=f"Closed loop from ({_initial[0]:.2f}, 0)", ylabel="Angle")
+        _axes[0].legend()
+        _axes[1].set(xlabel="Time", ylabel="Angular velocity")
+        _fig.tight_layout()
+        _figures.append(_fig)
+    mo.vstack(_figures)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Which policy brings the pendulum up from $(\pi,0)$ faster? Why does value
+    iteration keep a small oscillation around upright?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Answer:** both swing up, since the torque bound 10 exceeds gravity. Value
+    iteration is upright after about 1.4 s, at a cost close to $V(\pi,0)$; the
+    clipped LQR overshoots and needs about 3.5 s, at roughly 30% higher cost.
+    The oscillation comes from the grid: value iteration only chooses among
+    21 torques and interpolates $V$.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Extra: Riccati iteration
+    `solve_discrete_are` hides how $X$ is computed. As in the lecture, iterate
+    the Riccati recursion from $X=Q$ until the largest change is below a
+    tolerance:
+
+    $$
+    X_{\rm new}=Q+A^\top XA-A^\top XB\,(R+B^\top XB)^{-1}B^\top XA.
+    $$
+
+    This is value iteration for LQR: the value function $s^\top Xs$ is stored
+    as a matrix instead of on a grid. The cell compares the result with SciPy's $X$.
+    """)
+    return
+
+
+@app.cell
+def _(A, B, Q, R, X, np):
+    def riccati_iteration(A, B, Q, R, tolerance=1e-9):
+        X_k = Q
+        for iteration in range(1, 10_000):
+            X_next = Q + A.T @ X_k @ A - A.T @ X_k @ B @ np.linalg.solve(R + B.T @ X_k @ B, B.T @ X_k @ A)  # One step of the Riccati recursion.
+            delta = np.abs(X_next - X_k).max()
+            X_k = X_next
+            if delta < tolerance:
+                break
+        return X_k, iteration
+
+    X_iterated, riccati_iterations = riccati_iteration(A, B, Q, R)
+    print("Converged after", riccati_iterations, "iterations")
+    print("max |X_iterated - X|:", np.abs(X_iterated - X).max())
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Extensions:** vary $\gamma$, or refine the state or action grid. Note that
+    the angle is not wrapped: $(2\pi,0)$ is upright, but counts as far from the
+    target.
+
+    Finally, switch off the interpolation: pass `method="nearest"` to
+    `RegularGridInterpolator` in `interpolate_future`, so that $V$ is taken from
+    the nearest grid point. What changes in the closed loop near upright?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Answer:** from $(0.1,0)$ the pendulum no longer settles but keeps
+    drifting by about $\pm0.04$ rad. Near upright, one step changes the state
+    by less than half a grid spacing, so rounding maps it back to the same grid
+    point and the policy keeps choosing the same torque. The swing-up from
+    $(\pi,0)$ hardly changes.
+    """)
     return
 
 
