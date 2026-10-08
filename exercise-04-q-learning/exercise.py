@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 
@@ -107,6 +107,7 @@ def _(encode_gif, gym, mo):
         if _steps <= 50:
             _frames.append(_env.render())
         if _terminated or _truncated:
+            print(f"terminated in {_steps} steps")
             break
     _env.close()
     print(f"Random policy: return {_total:.0f} after {_steps} steps, goal reached: {_terminated}")
@@ -134,11 +135,14 @@ def _(mo):
     return
 
 
-@app.function
-def select_action(Q, state, epsilon, rng):
-    if rng.random() < epsilon:
-        return ...  # TODO: random action with rng.integers.
-    return ...
+@app.cell
+def select_action(np):
+    def select_action(Q, state, epsilon, rng):
+        if rng.random() < epsilon:
+            return rng.integers(4)  # TODO: random action with rng.integers.
+        return np.argmax(Q[state])
+
+    return (select_action,)
 
 
 @app.cell(hide_code=True)
@@ -151,7 +155,7 @@ def _(mo):
 
 
 @app.cell
-def _(np):
+def _(np, select_action):
     _Q = np.zeros((48, 4))
     _Q[36] = [-1.0, 0.0, -2.0, -3.0]
     _rng = np.random.default_rng(0)
@@ -176,11 +180,14 @@ def _(mo):
     return
 
 
-@app.function
-def update(Q, state, action, reward, next_state, terminated, alpha, gamma):
-    # Only termination stops bootstrapping, not truncation.
-    target = ...  # TODO: TD target.
-    Q[state, action] += alpha * (target - Q[state, action])
+@app.cell
+def update(np):
+    def update(Q, state, action, reward, next_state, terminated, alpha, gamma):
+        # Only termination stops bootstrapping, not truncation.
+        target = reward + gamma * (1 - terminated) * np.max(Q[next_state])  # TODO: TD target.
+        Q[state, action] += alpha * (target - Q[state, action])
+
+    return (update,)
 
 
 @app.cell(hide_code=True)
@@ -193,7 +200,7 @@ def _(mo):
 
 
 @app.cell
-def _(np):
+def _(np, update):
     _Q = np.zeros((48, 4))
     _Q[24] = [-4.0, -2.0, -6.0, -8.0]
     update(_Q, state=36, action=0, reward=-1.0, next_state=24, terminated=False, alpha=0.5, gamma=1.0)
@@ -260,8 +267,14 @@ def _(mo):
 
 
 @app.cell
-def _(epsilon, plot_training, train):
+def _(epsilon, plot_training, select_action, train, update):
     Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value)
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, alpha=1e-2) # for the extension, should converge much more slowly, and not until the end
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, alpha=1e-1) # for the extension, smaller than default but still converges
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, alpha=1e1) # for the extension, should blow up
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, gamma=0.5) # for the extension, converges to an okayish policy but definitely not optimal
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, gamma=0.9) # for the extension, converges to optimal policy
+    # Q, rewards, lengths = train(select_action, update, epsilon=epsilon.value, gamma=0.95) # for the extension, converges to optimal policy
     print("Mean training return of the last 20 episodes:", rewards[-20:].mean())
     print("Estimated start value max_a Q(36, a):", Q[36].max())
     plot_training(rewards, lengths)
