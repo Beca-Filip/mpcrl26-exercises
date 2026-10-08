@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 
@@ -121,8 +121,8 @@ def _(mo):
 @app.cell
 def _(np, solve_discrete_are):
     def lqr_gain(A, B, Q, R):
-        X = ...  # TODO: solution of the DARE with solve_discrete_are.
-        K = ...  # TODO: gain for mu(s) = -K s; use np.linalg.solve instead of an explicit inverse.
+        X = solve_discrete_are(A, B, Q, R)  # TODO: solution of the DARE with solve_discrete_are.
+        K = np.linalg.solve(B.T @ X @ B + R, B.T @ X @ A)  # TODO: gain for mu(s) = -K s; use np.linalg.solve instead of an explicit inverse.
         return K, X
 
     return (lqr_gain,)
@@ -210,6 +210,7 @@ def _(mo):
 def _(RegularGridInterpolator):
     def interpolate_future(grids, values, next_states):
         interpolation = RegularGridInterpolator(grids, values, bounds_error=False, fill_value=1e12)
+        # interpolation = RegularGridInterpolator(grids, values, bounds_error=False, fill_value=1e12, method="nearest") # for the extension exercise, you can try this instead of the default linear interpolation.
         return interpolation(next_states.reshape(-1, 2)).reshape(next_states.shape[:-1])
 
     return (interpolate_future,)
@@ -246,13 +247,13 @@ def _(mo):
 @app.cell
 def _(interpolate_future, np):
     def value_iteration(grids, states, actions, next_states, Q, R, gamma, tolerance=1e-2):
-        stage = ...  # TODO: stage costs l(s, u) with shape (101, 51, 21): s^T Q s per state plus R u^2 per action.
+        stage = np.einsum("...i,ij,...j->...", states, Q, states)[..., None] + R * actions**2 # TODO: stage costs l(s, u) with shape (101, 51, 21): s^T Q s per state plus R u^2 per action.
         V = np.zeros(states.shape[:-1])
         for iteration in range(1, 10_000):
             future = interpolate_future(grids, V, next_states)
-            costs = ...  # TODO: l(s, u) + gamma V(f(s, u)) for every state and action.
-            V_new = ...  # TODO: minimize over the action axis.
-            delta = ...  # TODO: largest change max_s |V_new(s) - V(s)|.
+            costs = stage + gamma * future  # TODO: l(s, u) + gamma V(f(s, u)) for every state and action.
+            V_new = np.min(costs, axis=-1)  # TODO: minimize over the action axis.
+            delta = np.max(np.abs(V_new - V), axis=None)  # TODO: largest change max_s |V_new(s) - V(s)|.
             V = V_new
             if delta < tolerance:
                 break
@@ -347,7 +348,20 @@ def _(mo):
 
 
 @app.cell
-def _(K, Q, R, V, actions, gamma, grids, interpolate_future, mo, np, plt, transition):
+def _(
+    K,
+    Q,
+    R,
+    V,
+    actions,
+    gamma,
+    grids,
+    interpolate_future,
+    mo,
+    np,
+    plt,
+    transition,
+):
     def vi_policy(state):
         # Greedy action at the exact state: evaluate l(s, u) + gamma V(f(s, u)) for all actions.
         successors = transition(np.broadcast_to(state, (len(actions), 2)), actions)
@@ -412,7 +426,7 @@ def _(A, B, Q, R, X, np):
     def riccati_iteration(A, B, Q, R, tolerance=1e-9):
         X_k = Q
         for iteration in range(1, 10_000):
-            X_next = ...  # TODO: one step of the Riccati recursion.
+            X_next = Q + A.T @ X_k @ A - A.T @ X_k @ B @ np.linalg.solve(R + B.T @ X_k @ B, B.T @ X_k @ A)  # TODO: one step of the Riccati recursion.
             delta = np.abs(X_next - X_k).max()
             X_k = X_next
             if delta < tolerance:
