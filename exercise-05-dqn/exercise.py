@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 
@@ -44,8 +44,8 @@ def _(nn):
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(state_dim, 64), nn.ReLU(),
-                ...,  # TODO: second hidden layer and activation.
-                ...,  # TODO: one unconstrained output per action.
+                nn.Linear(64, 64), nn.ReLU(),  # TODO: second hidden layer and activation.
+                nn.Linear(64, action_dim)  # TODO: one unconstrained output per action.
             )
 
         def forward(self, states):
@@ -88,7 +88,7 @@ def _(mo):
 def store(replay, state, action, reward, next_state, terminated):
     # Copy observations: replay should not reference mutable environment arrays.
     transition = (state.copy(), int(action), float(reward), next_state.copy(), bool(terminated))
-    replay.append(...)  # TODO: insert this transition in the bounded deque.
+    replay.append(transition)
 
 
 @app.cell(hide_code=True)
@@ -153,8 +153,8 @@ def _(torch):
     def make_targets(rewards, next_states, terminated, target_q, gamma):
         # Targets are fixed regression labels during the online-network update.
         with torch.no_grad():
-            next_values = ...  # TODO: maximum target Q-value along the action axis.
-            return ...  # TODO: add reward and mask true terminal transitions.
+            next_values = torch.max(target_q(next_states), 1).values  # TODO: maximum target Q-value along the action axis.
+            return rewards + torch.logical_not(terminated).to(dtype=torch.float32) * gamma * next_values  # TODO: add reward and mask true terminal transitions.
 
     return (make_targets,)
 
@@ -283,6 +283,14 @@ def _(mo):
     caps episodes at 200 steps, so return 200 is the maximum. Success within a
     fixed episode count is not guaranteed; compare several seeds and learning curves.
     A small TD loss alone does not establish a good control policy.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+ 
     """)
     return
 
