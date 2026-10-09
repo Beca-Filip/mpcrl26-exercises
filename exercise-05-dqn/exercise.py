@@ -137,7 +137,8 @@ def _(mo):
     y_i=r_i+\gamma(1-d_i)\max_a Q_{\bar w}(s'_i,a).
     $$
 
-    Use `torch.no_grad()` and return `(B,)`. The supplied loop minimizes
+    Use `torch.no_grad()`. The targets are a tensor of shape `(B,)`, one value per
+    transition. The supplied loop minimizes
     $B^{-1}\sum_i(Q_w(s_i,a_i)-y_i)^2$. Explain why the target is detached and
     why `gather` selects the sampled action value, rather than the max current value.
 
