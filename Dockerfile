@@ -40,6 +40,8 @@ COPY --chown=vscode:vscode . /workspace
 USER vscode
 
 # Let `uv run` in the container use the image's Python, never a host `.venv`
-# that the bind mount brings into /workspace.
+# that the bind mount brings into /workspace. Agg avoids matplotlib hanging on
+# the X11 display that VS Code forwards into the container.
 ENV UV_PROJECT_ENVIRONMENT=/usr/local \
-    UV_NO_SYNC=1
+    UV_NO_SYNC=1 \
+    MPLBACKEND=Agg

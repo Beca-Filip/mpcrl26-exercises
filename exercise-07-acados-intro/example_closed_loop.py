@@ -1,6 +1,7 @@
 import numpy as np
-from acados_template import AcadosOcpSolver, AcadosSimSolver, AcadosSim, plot_trajectories
-from setup_ocp_sol import setup_ocp
+from acados_template import AcadosOcpSolver, AcadosSimSolver, AcadosSim
+from plot_utils import plot_trajectories
+from setup_ocp import setup_ocp
 import matplotlib.pyplot as plt
 
 def main():
@@ -58,7 +59,7 @@ def main():
     plot_trajectories(
         x_traj_list=[simX],
         u_traj_list=[simU],
-        time_traj_list=[np.linspace(0, Tf, Nsim+1)],
+        time_traj_list=[np.linspace(0, Nsim*dt, Nsim+1)],
         time_label=model.t_label,
         labels_list=['closed loop result'],
         x_labels=model.x_labels,
@@ -66,8 +67,11 @@ def main():
         idxbu=ocp.constraints.idxbu,
         lbu=ocp.constraints.lbu,
         ubu=ocp.constraints.ubu,
+        show_plot=False,
+        fig_filename='closed_loop_results.png',
+        latexify=False,
+        background_transparent=False,
     )
-    plt.savefig("test.png")
 
 if __name__ == '__main__':
     main()
