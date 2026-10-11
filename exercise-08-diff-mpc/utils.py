@@ -48,7 +48,7 @@ def plot_sol_and_sens(x_values:np.ndarray, pis: list[np.ndarray], senss: list[np
     if isinstance(failed_x, torch.Tensor):
         failed_x = failed_x.detach().numpy()
 
-    if failed_x is not None:
+    if failed_x is not None and len(failed_x) > 0:
         axes[0].plot(failed_x, np.zeros_like(failed_x), 'ro', label="not converged")
         axes[1].plot(failed_x, np.zeros_like(failed_x), 'ro', label="not converged")
 
@@ -78,7 +78,7 @@ def plot_sol_and_sens(x_values:np.ndarray, pis: list[np.ndarray], senss: list[np
     plt.tight_layout()
 
     name = "sharp_solution.pdf"
-    if failed_x is not None:
+    if failed_x is not None and len(failed_x) > 0:
         name = "smoothed_solution.pdf"
     plt.savefig(name)
 

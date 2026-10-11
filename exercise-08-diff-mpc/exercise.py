@@ -33,6 +33,9 @@ def _(mo):
     mo.md(r"""
     # Exercise 08 — Differentiating acados with leap-c
 
+    **Goal:** make the MPC from Exercise 07 a differentiable PyTorch layer with
+    `leap-c`, and inspect its sensitivities.
+
     In this exercise, we show how to extend the acados formulation from the
     previous exercise step-by-step, to arrive at a leap-c controller layer that
     can be used to train parameters with PyTorch. As an example, we will use this
@@ -44,29 +47,30 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.image("img/cartpole.png", width=420,
-             caption="An illustration of Cart Pole while swinging up.")
+    mo.md(r"""
+    <p align="center">
+      <img src="public/cartpole.png" width="420" alt="An illustration of Cart Pole while swinging up."><br>
+      <em>An illustration of Cart Pole while swinging up.</em>
+    </p>
+    """)
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 1. Parametric sensitivities
-
-    ### 1.1 The parameter manager
+    ## 1. Parameters in the OCP
     Make yourself familiar with the
-    [`AcadosParameterManager`](https://github.com/leap-c/leap-c/blob/main/leap_c/parameters/manager.py#15)
+    [`AcadosParameterManager`](https://github.com/leap-c/leap-c/blob/main/leap_c/parameters/manager.py#L15)
     class.
 
-    ### 1.2 Introducing parameters into the OCP
     The goal now is to make a modified version of `setup_ocp()`, in which the
     parameter manager class is used to introduce new parameters into the acados
     ocp formulation.
 
     Create the parameter manager and register 5 parameters, one for each field in
     the reference part of the cost. Make only the reference of the angle $\theta$
-    learnable. Assemble the parameters to create `yref`.
+    differentiable. Assemble the parameters to create `yref`.
 
     Complete `setup_ocp_with_manager()` below.
     """)
@@ -93,7 +97,7 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
 
         nx = ocp.model.x.rows()
 
-        # TODO Exercise 1.2: Create the parameter manager.
+        # TODO Exercise 1: Create the parameter manager.
         manager = ...
 
         # ======================= set cost =======================
@@ -113,10 +117,10 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
         ocp.model.cost_y_expr_e = ocp.model.x
 
         # references
-        # TODO Exercise 1.2: Use the parameter manager to obtain parameters 
+        # TODO Exercise 1: Use the parameter manager to obtain parameters 
         # and then build xref accordingly. 
         # Register one parameter per reference field and make
-        # only xref1 (the angle reference) learnable via differentiable=True.
+        # only xref1 (the angle reference) differentiable with `differentiable=True`.
         uref = ...
         xref = ...
         yref = ca.vertcat(xref, uref)
@@ -144,9 +148,6 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
         ocp.solver_options.tol = 1e-3
         ocp.solver_options.nlp_solver_max_iter = 1000
 
-        # ============= Finalize =============
-        ocp.code_export_directory = 'c_generated_code_ocp'
-
         return ocp, manager
 
     return
@@ -155,13 +156,12 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 1.3 The differentiable MPC layer
+    ## 2. Solving a batch of OCPs
     Familiarize yourself with
     [`AcadosDiffMpcTorch`](https://github.com/leap-c/leap-c/blob/main/leap_c/torch.py#L29)
     (see also
     [`AcadosDiffMpcCtx`](https://github.com/leap-c/leap-c/blob/main/leap_c/diff_mpc/function.py#L29)).
 
-    ### 1.4 Solving a batch of OCPs
     Create an instance in the cell below and use it to solve a batch of
     optimization problems with varying reference of the angle.
     """)
@@ -182,14 +182,14 @@ def _(mo, np, plot_sol_and_sens, torch):
     # Enable gradient computation for this tensor
     p_values.requires_grad = True
 
-    # TODO Exercise 1.4: Create the controller layer.
+    # TODO Exercise 2: Create the controller layer.
     controller_layer = ...
 
     x0_npy = np.array([0.0, np.pi, 0.0, 0.0])
     x0_npy = np.tile(x0_npy, (p_values_npy.shape[0], 1))  # Shape (N, 4)
     x0 = torch.tensor(x0_npy, dtype=torch.float32)
 
-    # TODO Exercise 1.4: Solve the batch of OCPs.
+    # TODO Exercise 2: Solve the batch of OCPs.
     params = ...
     ctx, u0, x, u, value = ...
 
@@ -199,18 +199,45 @@ def _(mo, np, plot_sol_and_sens, torch):
 
     du0_dp_npy = du0_dp.detach().numpy().flatten()
     u0_npy = u0.detach().numpy().flatten()
+    return batch_size, ctx, du0_dp_npy, p_values_npy, u0_npy
 
-    # TODO Exercise 1.7: Mask here.
-    # mask = ...
-    # u0_npy = ...
-    # du0_dp_npy = ...
-    # p_values_npy_failed = ...
-    # p_values_npy = ...
 
-    du0_dp_fd = np.gradient(u0_npy, p_values_npy.flatten())
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    The cell below masks the samples. For now it keeps all of them, you complete
+    the mask in Exercise 5.
+    """)
+    return
+
+
+@app.cell
+def _(batch_size, ctx, du0_dp_npy, np, p_values_npy, u0_npy):
+    # TODO Exercise 5: Keep only the samples that converged (status 0).
+    mask = np.ones(batch_size, dtype=bool)
+    p_converged = p_values_npy[mask]
+    u0_converged = u0_npy[mask]
+    du0_dp_converged = du0_dp_npy[mask]
+    p_failed = p_values_npy[~mask]
+    return du0_dp_converged, p_converged, p_failed, u0_converged
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    The left plot shows the first action $u_0$ over the angle reference
+    $\theta_\mathrm{ref}$. The right plot shows its sensitivity from acados next to
+    finite differences of $u_0$. Red dots mark samples that did not converge.
+    """)
+    return
+
+
+@app.cell
+def _(du0_dp_converged, mo, np, p_converged, p_failed, plot_sol_and_sens, u0_converged):
+    du0_dp_fd = np.gradient(u0_converged, p_converged.flatten())
 
     test_tol = 1e-3
-    median_diff = np.median(np.abs(du0_dp_npy - du0_dp_fd))
+    median_diff = np.median(np.abs(du0_dp_converged - du0_dp_fd))
     print("Median difference between policy gradient obtained by acados and via FD is "
           f"{median_diff} should be < {test_tol}.")
 
@@ -224,9 +251,10 @@ def _(mo, np, plot_sol_and_sens, torch):
 
     sens_pi_label_pairs.append('finite diff.')
 
-    fig = plot_sol_and_sens(x_values=p_values_npy, pis=[u0_npy],
-                      senss=[du0_dp_npy, du0_dp_fd], pi_labels=pi_label_pairs,
+    fig = plot_sol_and_sens(x_values=p_converged, pis=[u0_converged],
+                      senss=[du0_dp_converged, du0_dp_fd], pi_labels=pi_label_pairs,
                       sens_labels=sens_pi_label_pairs,
+                      failed_x=p_failed,
                       )
     mo.mpl.interactive(fig)
     return
@@ -235,25 +263,27 @@ def _(mo, np, plot_sol_and_sens, torch):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 1.5 Sensitivities
+    ## 3. Sensitivities
     If you run the notebook now, the batchwise derivatives
     $\frac{\partial u_0}{\partial \theta}$ of shape $(n_\mathrm{batch}, 1)$ are
     computed and plotted alongside the solutions. The solution is also used to
     compute and plot finite differences. Think about what the plots mean in the
     context of learning.
+    **Note:** the cart pole has a very non-smooth solution map. Many problems have
+    much better-behaved solution maps, and we look at such an example tomorrow.
 
-    ### 1.6 The `tau_min` solver option
+    ## 4. Smoothing with $\tau_\mathrm{min}$
     Set the option `ocp.solver_options.tau_min = 1e-1` in `setup_ocp_with_manager()`
-    above. This basically sets the minimum barrier parameter
-    inside the interior point solving. Run the notebook again. What do you observe?
+    above. This sets the minimum barrier parameter $\tau_\mathrm{min}$ of the
+    interior-point solver. Run the notebook again. What do you observe?
 
-    ### 1.7 Masking samples
+    ## 5. Masking failed samples
     The field `ctx.status` from the `controller_layer` output contains the status
     of the solutions, one status for each sample in the batch. Only status $0$ means that the sample converged.
     Use the status to mask away the samples in the batch that did not converge.
     Also pass the samples in the batch that did *not* converge, to the plotting
     function as `failed_x` to clean the plots. Run the notebook again. What do you
-    see? Complete the mask in the cell below.
+    see? Complete the mask in the masking cell above.
     """)
     return
 
@@ -261,16 +291,14 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 1.8 Bonus
+    ## 6. Bonus and resources
     Feel free to play around with, e.g., values of the parameters, ocp
     formulations, solver options, calculating other sensitivities, making
     parameters differ over the horizon (field `splits` in `register_parameter`), ...
 
-    ### Useful resources
-    - [acados problem formulation PDF](https://github.com/acados/acados/blob/master/docs/problem_formulation/problem_formulation_ocp_mex.pdf)
-    - [`AcadosParameterManager`](https://github.com/leap-c/leap-c/blob/main/leap_c/parameters/manager.py#15)
-    - [`AcadosDiffMpcTorch`](https://github.com/leap-c/leap-c/blob/main/leap_c/torch.py#L29)
-    - [`AcadosDiffMpcCtx`](https://github.com/leap-c/leap-c/blob/main/leap_c/diff_mpc/function.py#L29)
+    **Useful resources:**
+    - [acados problem formulation](https://github.com/acados/acados/blob/master/docs/problem_formulation/problem_formulation_ocp_mex.pdf): the general OCP that acados solves, with all cost and constraint types
+    - [leap-c-lab](https://github.com/leap-c/leap-c-lab): example environments, OCPs and planners built on leap-c
     """)
     return
 
