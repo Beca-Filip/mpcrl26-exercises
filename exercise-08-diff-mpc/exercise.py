@@ -175,19 +175,15 @@ def _(mo, np, plot_sol_and_sens, torch):
     Fmax = 80.0
     delta_p = 0.005
 
-    p_values_npy = np.arange(0.5*np.pi, 1.5*np.pi, delta_p)
-    p_values_npy = p_values_npy.reshape(-1, 1)  # Shape (N, 1)
-    batch_size = p_values_npy.shape[0]
-    p_values = torch.tensor(p_values_npy, dtype=torch.float32)
+    p_values = torch.arange(0.5*torch.pi, 1.5*torch.pi, delta_p).reshape(-1, 1)  # Shape (N, 1)
+    batch_size = p_values.shape[0]
     # Enable gradient computation for this tensor
     p_values.requires_grad = True
 
     # TODO Exercise 2: Create the controller layer.
     controller_layer = ...
 
-    x0_npy = np.array([0.0, np.pi, 0.0, 0.0])
-    x0_npy = np.tile(x0_npy, (p_values_npy.shape[0], 1))  # Shape (N, 4)
-    x0 = torch.tensor(x0_npy, dtype=torch.float32)
+    x0 = torch.tensor([0.0, torch.pi, 0.0, 0.0]).repeat(batch_size, 1)  # Shape (N, 4)
 
     # TODO Exercise 2: Solve the batch of OCPs.
     params = ...
@@ -196,10 +192,7 @@ def _(mo, np, plot_sol_and_sens, torch):
     # Obtain the batched gradient du0/dp of shape (batch_size, 1)
     u0.sum().backward()
     du0_dp = p_values.grad
-
-    du0_dp_npy = du0_dp.detach().numpy().flatten()
-    u0_npy = u0.detach().numpy().flatten()
-    return batch_size, ctx, du0_dp_npy, p_values_npy, u0_npy
+    return batch_size, ctx, du0_dp, p_values, u0
 
 
 @app.cell(hide_code=True)
@@ -212,13 +205,14 @@ def _(mo):
 
 
 @app.cell
-def _(batch_size, ctx, du0_dp_npy, np, p_values_npy, u0_npy):
+def _(batch_size, ctx, du0_dp, np, p_values, u0):
     # TODO Exercise 5: Keep only the samples that converged (status 0).
     mask = np.ones(batch_size, dtype=bool)
-    p_converged = p_values_npy[mask]
-    u0_converged = u0_npy[mask]
-    du0_dp_converged = du0_dp_npy[mask]
-    p_failed = p_values_npy[~mask]
+    # Convert to NumPy for plotting.
+    p_converged = p_values.detach().numpy()[mask]
+    u0_converged = u0.detach().numpy().flatten()[mask]
+    du0_dp_converged = du0_dp.numpy().flatten()[mask]
+    p_failed = p_values.detach().numpy()[~mask]
     return du0_dp_converged, p_converged, p_failed, u0_converged
 
 
