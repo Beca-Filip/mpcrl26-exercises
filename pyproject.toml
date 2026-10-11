@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "casadi>=3.6,<4",
     "gymnasium[classic-control,toy-text]>=1.0,<2",
+    "leap-c",
     "matplotlib>=3.8,<4",
     "marimo>=0.25,<1",
     "numpy>=1.26,<2",
@@ -28,6 +29,7 @@ packages = []
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+leap-c = { git = "https://github.com/leap-c/leap-c.git", rev = "217e1c8ae0d47b4219ee8ebd69630f48e3cf3eff" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
