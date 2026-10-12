@@ -1,11 +1,11 @@
 """Helpers for Exercise 10 that are not part of the `wec` package: closed-loop evaluation of a
-policy on the Gymnasium environment, the power landscape, the training configuration, the
-gradient check, result table and plots.
+policy on the differentiable plant, the training configuration, the gradient check, result
+table and plots.
 
 A policy is anything with the call signature of a `ParameterizedController` without parameters,
     ctx, u = policy(obs, ctx=None)
 for a batch of observations obs (B, 4) = [x, v, w1, w2] and PTO forces u (B, 1) in Newtons:
-`LinearController`, or the notebook's `FixedMpcPolicy` and `MpcPolicy` around the MPC controller.
+`LinearController`, or the notebook's `MpcPolicy` around the MPC controller.
 """
 
 from dataclasses import dataclass
@@ -14,21 +14,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from wec import WecDynamics, WecEnv, WecPlanner, g_polar, polar
+from wec import WecDynamics, polar
 
 # --------------------------------------------------------------------------- closed loop
-def simulate(env: WecEnv, policy, n_steps: int) -> dict[str, np.ndarray]:
-    """Closed-loop rollout from rest, one solve per step and no warm start. Pe[i] is the mean
-    electrical power over sample i [W]."""
-    obs, _ = env.reset()
-    log = {k: np.zeros(n_steps) for k in ("t", "x", "v", "u", "Fex", "Pe")}
-    for i in range(n_steps):
-        with torch.no_grad():
-            _, a = policy(torch.from_numpy(obs)[None])
-        u = float(a[0, 0])
-        log["x"][i], log["v"][i], log["u"][i] = obs[0], obs[1], u
-        obs, _, _, _, info = env.step(np.array([u]))
-        log["t"][i], log["Fex"][i], log["Pe"][i] = info["t"], info["Fex"], info["Pe"]
+def simulate(plant: WecDynamics, policy, n_steps: int) -> dict[str, np.ndarray]:
+    """Closed-loop rollout of one plant from rest at a wave crest, one solve per step and no warm
+    start. Pe[i] is the mean electrical power over sample i [W]."""
+    obs = plant.reset(torch.zeros(1, dtype=torch.float64))
+    log = {k: np.zeros(n_steps) for k in ("t", "x", "v", "u", "Pe")}
+    with torch.no_grad():
+        for i in range(n_steps):
+            _, u = policy(obs)
+            log["t"][i], log["x"][i], log["v"][i], log["u"][i] = i * plant.dt, obs[0, 0], obs[0, 1], u[0, 0]
+            obs, energy = plant.step(obs, u)
+            log["Pe"][i] = float(energy[0]) / plant.dt
     return log
 
 
@@ -37,41 +36,11 @@ def steady_mean(sig: np.ndarray, n_per: int, n_periods: int = 5) -> float:
     return float(np.mean(sig[-n_per * n_periods:]))
 
 
-def fundamental(sig: np.ndarray, n_per: int) -> complex:
-    """Complex amplitude of the fundamental of sig over its last period, s(t) = Re{S e^{j omega t}}."""
-    e = np.exp(-2j * np.pi * np.arange(n_per) / n_per)
-    return complex(2 * (sig[-n_per:] @ e) / n_per)
-
-
-def phase_deg(ref: np.ndarray, sig: np.ndarray, n_per: int) -> float:
-    """Phase of sig relative to ref over the last period [deg]; positive means sig leads."""
-    return float(np.degrees(np.angle(fundamental(sig, n_per) / fundamental(ref, n_per))))
-
-
-def evaluate(policy, env: WecEnv, periods: int = 20) -> dict:
-    """Closed loop of a policy on the environment from rest; steady-state numbers are means over
-    the last 5 periods."""
-    log = simulate(env, policy, periods * env.n_per)
-    return dict(power=steady_mean(log["Pe"], env.n_per), xmax=float(np.abs(log["x"]).max()),
-                umax=float(np.abs(log["u"]).max()),
-                v_phase=phase_deg(log["Fex"], log["v"], env.n_per), log=log)
-
-
-def power_landscape(planner: WecPlanner, env: WecEnv, gains, phases, periods: int = 12) -> dict:
-    """Closed-loop mean power of the MPC on the plant env for every (gain, phase) of its
-    excitation coefficient. All grid points run as one batch of plants (about 80 000 solves)."""
-    G = np.array([g_polar(gn, ph) for gn in gains for ph in phases])          # (B, 2)
-    Bsz, n_steps = len(G), periods * env.n_per
-    g_t = torch.from_numpy(G)                                                   # differentiable parameter: (B, 2) tensor
-    obs = env.dynamics.reset(torch.zeros(Bsz, dtype=torch.float64))            # every plant from rest at a crest
-    Pe = np.zeros((Bsz, n_steps))
-    with torch.no_grad():
-        for i in range(n_steps):
-            u = planner(obs, params={"g": g_t})[1]
-            obs, energy = env.dynamics.step(obs, u)
-            Pe[:, i] = energy.numpy() / env.d.dt
-    P = Pe[:, -5 * env.n_per:].mean(axis=1).reshape(len(gains), len(phases))
-    return dict(gain=np.asarray(gains), phase=np.asarray(phases), P=P)
+def evaluate(policy, plant: WecDynamics, periods: int = 20) -> dict:
+    """Closed loop of a policy on the plant from rest; the power is the mean over the last 5
+    periods."""
+    log = simulate(plant, policy, periods * plant.n_per)
+    return dict(power=steady_mean(log["Pe"], plant.n_per), xmax=float(np.abs(log["x"]).max()), log=log)
 
 
 # --------------------------------------------------------------------------- RL configuration
@@ -83,18 +52,16 @@ class ShacConfig:
     x_max: float                 # stroke limit [m]: reward penalty and state scaling
     horizon: int = 10            # h: rollout length per iteration [steps]
     n_env: int = 16              # parallel plants = batch size of the MPC solver
-    iters: int = 150             # actor updates
+    iters: int = 300             # actor updates
     gamma: float = 0.99
-    critic: bool = True          # False: truncated BPTT (no terminal value)
     lam: float = 0.95            # TD(lambda)
-    actor_lr: float = 0.02       # Adam, decays linearly to 10 %
+    actor_lr: float = 0.01       # Adam, decays linearly to 10 %
     critic_lr: float = 1e-3
     critic_epochs: int = 16
     critic_warmup: int = 50      # critic-only iterations before the actor moves
     target_alpha: float = 0.4    # target critic: phi' <- alpha phi' + (1 - alpha) phi
     episode_len: int = 80        # steps between random restarts
     restart_scale: float = 0.7   # restart buoy state: uniform in +-scale (x_max, omega x_max)
-    action_noise: float = 0.0    # Gaussian noise on the PTO force while training [N]
     grad_clip: float = 1.0
     viol_weight: float = 1e8     # stroke-violation penalty in the reward [J/m^2]
     seed: int = 0
@@ -136,10 +103,10 @@ def test_rollout_gradient(policy, plant: WecDynamics) -> None:
           f"relative error {np.abs(grad.numpy() - fd).max() / np.abs(fd).max():.1e} (expected < 1e-3)")
 
 
-def summarize(policy, env: WecEnv) -> dict:
+def summarize(policy, plant: WecDynamics) -> dict:
     """Training callback: steady-state power and the policy's excitation coefficient."""
     gain, phase = polar(policy.g.detach().numpy())
-    ev = evaluate(policy, env)
+    ev = evaluate(policy, plant)
     return dict(power=ev["power"], xmax=ev["xmax"], gain=gain, phase=phase)
 
 
@@ -154,10 +121,8 @@ def result_table(rows: list[tuple], P_nom: float, P_orc: float) -> str:
 
 
 # --------------------------------------------------------------------------- plots
-C_LQ, C_PAS = "#2a78d6", "#eb6834"
-C_MPC, C_NOM, C_SHAC, C_BPTT, C_SHORT = "#1baf7a", "#eda100", "#4a3aa7", "#008300", "#e87ba4"
-_KEYS = (("truncated", C_SHORT), ("SHAC", C_SHAC), ("BPTT", C_BPTT), ("nominal", C_NOM),
-         ("LQ", C_LQ), ("passive", C_PAS), ("damper", C_PAS))
+C_PAS, C_MPC, C_NOM, C_SHAC = "#eb6834", "#1baf7a", "#eda100", "#4a3aa7"
+_KEYS = (("SHAC", C_SHAC), ("nominal", C_NOM), ("passive", C_PAS), ("damper", C_PAS))
 
 
 def _color(label: str) -> str:
@@ -192,83 +157,30 @@ def plot_closed_loop(logs: dict[str, dict], x_max: float, u_max: float, n_per: i
     return fig
 
 
-def plot_phasors(logs: dict[str, dict], n_per: int):
-    """Velocity against the plant's excitation force: traces (left) and phasors (right).
-
-    Reactive control wants v in phase with F_ex. The right panel draws F_ex as the reference
-    arrow at angle 0 and one velocity arrow per controller at its relative phase.
-    """
-    fig, (ax_t, ax_p) = plt.subplots(1, 2, figsize=(11, 4.2), gridspec_kw=dict(width_ratios=[1.6, 1]))
-    first = next(iter(logs.values()))
-    sl = slice(-2 * n_per, None)
-    ts = first["t"][sl] - first["t"][sl][0]
-    ax_t.plot(ts, first["Fex"][sl] / np.abs(first["Fex"][-n_per:]).max(), "k--", lw=1.2, label="F_ex (plant)")
-    for label, lg in logs.items():
-        ax_t.plot(ts, lg["v"][sl] / np.abs(lg["v"][-n_per:]).max(), color=_color(label), lw=1.5, label=f"v, {label}")
-    ax_t.set(xlabel="time in the last two periods [s]", ylabel="normalised [-]", ylim=(-1.6, 1.2),
-             title="Velocity vs excitation force")
-    ax_t.grid(alpha=0.3)
-    ax_t.legend(fontsize=8, loc="lower right", ncol=3)
-
-    # Unit-length arrows at the phase of v relative to the plant's F_ex (amplitudes not shown).
-    ref = fundamental(first["Fex"], n_per)
-    arrows = {label: np.exp(1j * np.angle(fundamental(lg["v"], n_per) / ref)) for label, lg in logs.items()}
-    ax_p.annotate("", xy=(1, 0), xytext=(0, 0), arrowprops=dict(arrowstyle="->", lw=2, color="k"))
-    ax_p.text(1.02, 0.0, "F_ex", ha="left", va="center")
-    for label, ph in arrows.items():
-        ax_p.annotate("", xy=(ph.real, ph.imag), xytext=(0, 0),
-                      arrowprops=dict(arrowstyle="->", lw=2, color=_color(label)))
-        ax_p.text(1.08 * ph.real, 1.08 * ph.imag, f"{label}: {np.degrees(np.angle(ph)):+.0f} deg",
-                  color=_color(label), ha="left" if ph.real >= 0 else "right", va="center", fontsize=8)
-    th = np.linspace(0, 2 * np.pi, 200)
-    ax_p.plot(np.cos(th), np.sin(th), color="0.8", lw=0.8)
-    ax_p.set(xlim=(-1.3, 1.6), ylim=(-1.3, 1.3), aspect="equal", title="Phasors (counter-clockwise = leads)")
-    ax_p.axis("off")
-    fig.tight_layout()
-    return fig
-
-
-def plot_landscape(land: dict, g_true, paths: dict | None = None, ax=None):
-    """Contours of the closed-loop power over (phase, gain) of the MPC's excitation coefficient,
-    the nominal start, the true coefficient and optional training paths."""
-    if ax is None:
-        _, ax = plt.subplots(figsize=(6, 4.8))
-    if land is not None:
-        cs = ax.contour(land["phase"], land["gain"], land["P"] / 1e3,
-                        levels=[20, 25, 28, 30, 32, 33, 33.4], colors="0.4", linewidths=0.8)
-        ax.clabel(cs, fmt="%g kW", fontsize=7)
-        ax.set(xlim=(land["phase"][0], land["phase"][-1]), ylim=(0, land["gain"][-1]))
-    for r in (paths or {}).values():
-        ev = [e for e in r["log"] if "power" in e]
-        ax.plot([e["phase"] for e in ev], [e["gain"] for e in ev], "-o", color=r["color"],
-                lw=2, ms=3, label=r["label"])
-    ax.plot(0, 1, "o", color=C_NOM, ms=10, mec="w", mew=1.5, label="nominal model (start)")
-    gain, phase = polar(g_true)
-    ax.plot(phase, gain, "*", color=C_MPC, ms=16, mec="w", mew=1.2, label="true coefficient")
-    ax.set(xlabel="phase lag of the excitation force [deg]", ylabel="gain [-]",
-           title="Closed-loop power landscape P_e(gain, phase)")
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=8, loc="lower left")
-    return ax.figure
-
-
-def plot_training(runs: dict, P_nom: float, P_orc: float, g_true, land: dict | None):
-    """Left: steady-state power during training. Right: the paths of g on the power landscape.
-    runs: name -> dict(label, color, log) with log entries carrying env_steps, power, gain, phase."""
+def plot_training(log: list[dict], P_nom: float, P_orc: float, g_true):
+    """Left: steady-state power during training. Right: the path of g from the nominal model
+    towards the true coefficient. log entries carry env_steps, power, gain, phase."""
+    ev = [e for e in log if "power" in e]
     fig, axs = plt.subplots(1, 2, figsize=(12, 4.8))
     ax = axs[0]
     for P, text in ((P_orc, "MPC with the true excitation model"), (P_nom, "nominal model (start)")):
         ax.axhline(P / 1e3, color="0.5", lw=0.8)
         ax.annotate(text, (1, P / 1e3), xycoords=("axes fraction", "data"), fontsize=8,
                     ha="right", va="bottom", color="0.3")
-    for r in runs.values():
-        ev = [e for e in r["log"] if "power" in e]
-        ax.plot([e["env_steps"] / 1e3 for e in ev], [e["power"] / 1e3 for e in ev], "-o",
-                color=r["color"], lw=2, ms=3, label=r["label"])
+    ax.plot([e["env_steps"] / 1e3 for e in ev], [e["power"] / 1e3 for e in ev], "-o",
+            color=C_SHAC, lw=2, ms=3, label="SHAC")
     ax.set(xlabel="simulated environment steps [thousands]", ylabel="P_e [kW]",
            title="Steady-state power of the MPC during training")
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8, loc="lower right")
-    plot_landscape(land, g_true, paths=runs, ax=axs[1])
+    ax.legend(fontsize=8, loc="center right")
+    ax = axs[1]
+    ax.plot([e["phase"] for e in ev], [e["gain"] for e in ev], "-o", color=C_SHAC, lw=2, ms=3, label="SHAC")
+    ax.plot(0, 1, "o", color=C_NOM, ms=10, mec="w", mew=1.5, label="nominal model (start)")
+    gain, phase = polar(g_true)
+    ax.plot(phase, gain, "*", color=C_MPC, ms=16, mec="w", mew=1.2, label="true coefficient")
+    ax.set(xlabel="phase lag of the excitation force [deg]", ylabel="gain [-]", ylim=(0, 1.2),
+           title="Path of the MPC's excitation coefficient g")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc="lower left")
     fig.tight_layout()
     return fig

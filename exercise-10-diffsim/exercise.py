@@ -14,17 +14,11 @@ def _():
     import torch
     from torch import nn
     from utils import (
-        C_BPTT,
-        C_SHAC,
-        C_SHORT,
         REWARD_SCALE,
         ShacConfig,
         evaluate,
         plot_closed_loop,
-        plot_landscape,
-        plot_phasors,
         plot_training,
-        power_landscape,
         result_table,
         summarize,
         test_rollout_gradient,
@@ -33,11 +27,9 @@ def _():
         ControllerFromPlanner,
         LinearController,
         WECParams,
-        WecEnv,
-        WecEnvConfig,
+        WecDynamics,
         WecPlanner,
         WecPlannerConfig,
-        design_lq,
         discretise,
         g_polar,
         optimal_damper,
@@ -45,20 +37,15 @@ def _():
     )
 
     return (
-        C_BPTT,
-        C_SHAC,
-        C_SHORT,
         ControllerFromPlanner,
         LinearController,
         REWARD_SCALE,
         ShacConfig,
         WECParams,
-        WecEnv,
-        WecEnvConfig,
+        WecDynamics,
         WecPlanner,
         WecPlannerConfig,
         deepcopy,
-        design_lq,
         discretise,
         evaluate,
         g_polar,
@@ -67,11 +54,8 @@ def _():
         np,
         optimal_damper,
         plot_closed_loop,
-        plot_landscape,
-        plot_phasors,
         plot_training,
         polar,
-        power_landscape,
         result_table,
         summarize,
         test_rollout_gradient,
@@ -85,22 +69,22 @@ def _(mo):
     mo.md(r"""
     # Exercise 10 — Learning an MPC through a differentiable simulator
 
-    **Goal:** turn an acados MPC into a differentiable PyTorch policy with leap-c, write the
-    plant as a differentiable torch function, and train a parameter of the MPC with the
-    gradient of the simulated closed-loop return: short-horizon actor-critic (SHAC) and
-    truncated back-propagation through time (BPTT).
+    **Goal:** a wave energy converter is controlled by an economic MPC whose model of the wave
+    force is wrong in a single coefficient $g$. You will (1) see where this mismatch comes from,
+    (2) measure how much power the MPC with the nominal $g$ loses against the same MPC with the
+    true $g$, and (3) recover most of it by training $g$ with short-horizon actor-critic (SHAC)
+    through a differentiable simulation of plant and MPC.
 
-    Requirements: `leap_c` (main branch, commit `217e1c8`, API `leap_c.torch` and
-    `leap_c.parameters`), acados 0.5.3 with its `t_renderer` binary, CPU torch. The domain code
-    lives in the package `wec/` next to this notebook, structured like a system of
-    [leap-c-lab](https://github.com/leap-c/leap-c-lab): the model and its differentiable
-    dynamics (`wec/dynamics.py`), a Gymnasium environment (`wec/env.py`), linear controllers as
-    `ParameterizedController`s (`wec/controller.py`), the acados OCP (`wec/acados_ocp.py`) and
-    the MPC as a `ParameterizedPlanner` (`wec/planner.py`); `utils.py` has the evaluation and
-    plot helpers. The notebook compiles two small acados solvers (about 2 s each) into temporary
-    directories.
+    Requirements: `leap_c` (main branch, commit `217e1c8`), acados 0.5.3 with its `t_renderer`
+    binary, CPU torch; see the README. The domain code lives in the package `wec/` next to this
+    notebook, structured like a system of [leap-c-lab](https://github.com/leap-c/leap-c-lab): the
+    model and the differentiable plant (`wec/dynamics.py`), linear controllers
+    (`wec/controller.py`), the acados OCP (`wec/acados_ocp.py`) and the MPC as a
+    `ParameterizedPlanner` (`wec/planner.py`); `utils.py` has the evaluation, the training
+    configuration and the plots. The notebook compiles one small acados solver (about 2 s) into
+    a temporary directory.
 
-    ## 1. A wave energy converter
+    ## 1. A wave energy converter and its excitation coefficient
 
     A heaving point absorber: a hemispherical buoy (radius 2.5 m, about 59 t including added
     mass) in a regular wave of height 1 m and period 8 s. The power take-off (PTO) applies a
@@ -120,71 +104,69 @@ def _(mo):
     $$
 
     The **excitation coefficient** $g = (g_1, g_2)$ scales the force by $|g|$ and delays it by
-    the angle of $g$. The long-wave model has $g = (1, 0)$. This exercise is about what happens
-    when the plant has a different $g$ than the controller believes, and how to learn it.
+    the angle of $g$. The long-wave model, and with it the MPC below, has $g = (1, 0)$. The plant
+    in this exercise has $g^\star = 0.8\,(\cos 40^\circ, \sin 40^\circ)$: its excitation force
+    is 20 % weaker and lags the wave by 40 degrees.
 
-    **Power.** The PTO absorbs the mechanical power $-u\dot x$ and loses $r u^2$ in its
-    windings, so the electrical power is $P_e = -u v - r u^2$ and the controller minimises the
-    stage cost $\ell = u v + r u^2 = -P_e$. This cost is **indefinite**: an economic objective,
-    not a tracking error.
+    **Where the mismatch comes from.** The excitation force cannot be measured. It is
+    reconstructed from a wave estimate (a sensor on the buoy, a wave rider some distance
+    up-wave, a forecast), its amplitude and phase relative to the wave elevation depend on the
+    diffraction correction of the hydrodynamic model, and the buoy itself moves. At one wave
+    frequency all of these errors are a single complex number, a gain and a phase: $g$.
 
-    **Constraints.** A stroke limit $|x| \le 1.5$ m (soft: end stops, buoy must stay in the
-    water) and a force limit $|u| \le 300$ kN (hard).
+    **Power and constraints.** The PTO absorbs the mechanical power $-u\dot x$ and loses
+    $r u^2$ in its windings, so the electrical power is $P_e = -u v - r u^2$ and the controller
+    minimises the stage cost $\ell = u v + r u^2 = -P_e$, an economic objective. The stroke is
+    limited to $|x| \le 1.5$ m (soft: end stops) and the force to $|u| \le 300$ kN (hard).
 
-    **Simplifications.** Regular wave, hydrodynamic coefficients frozen at the wave frequency,
-    full state information including the wave state $w$ (in reality $F_{ex}$ is estimated, which
-    is where errors in $g$ come from), a smooth loss model, no viscous drag.
-
-    **Discrete time.** With a zero-order hold on $u$ and $\Delta t = 0.2$ s the sampled-data
-    model is exact: $z^+ = A z + G_w w + B_u u$ and $w^+ = \Phi_w w$ with $z = (x, v)$, and the
-    electrical energy of one sample is the quadratic form $-y^\top W_d\, y$ of
-    $y = (z, w, u)$. `discretise` in `wec/dynamics.py` computes $A, B_u, G_w, \Phi_w, W_d$ with
-    the Van Loan integral.
-
-    **The environment.** `WecEnv` in `wec/env.py` is a Gymnasium environment with the full
-    state $(x, v, w_1, w_2)$ as observation, the PTO force in Newtons as action and the
-    electrical energy of the sample in Joules as reward; an episode starts from rest and is
-    truncated after 20 wave periods. It steps the plant through `WecDynamics`, the same matrices
-    as the MPC, so its energy accounting has no integration error.
+    **Discrete time and the simulator.** With a zero-order hold on $u$ and $\Delta t = 0.2$ s
+    the sampled-data model is exact: $z^+ = A z + G_w w + B_u u$ and $w^+ = \Phi_w w$ with
+    $z = (x, v)$, and the electrical energy of one sample is $e = -y^\top W_d\, y$ with
+    $y = (z, w, u)$ (`discretise` in `wec/dynamics.py`, Van Loan integral). `WecDynamics` is this
+    plant written as pure tensor functions: `reset(phase)` returns buoys at rest in waves of the
+    given phases, and `step(obs, u)` maps $\mathrm{obs} = (z, w)$ and the force to
+    $(\mathrm{obs}^+, e)$. It stores no state, and the leading dimension is a free batch of
+    plants. It is the only simulator in this notebook: `evaluate` steps one plant through it
+    under `torch.no_grad()`, and the training loop of Section 4 steps a batch of plants with
+    autograd recording the whole rollout.
     """)
 
 
 @app.cell
-def _(WECParams, WecEnv, WecEnvConfig, discretise, g_polar, np):
+def _(WECParams, WecDynamics, discretise, g_polar, torch):
     DT, N, X_MAX, U_MAX = (
         0.2,
         20,
         1.5,
         300e3,
     )  # sample time [s], MPC horizon, stroke [m], force [N]
-    G_NOM, G_TRUE = (
-        np.array([1.0, 0.0]),
-        g_polar(0.8, 40.0),
-    )  # the MPC's model and the plant
-    GAINS, PHASES = (
-        np.linspace(0.3, 1.2, 10),
-        np.linspace(-10, 70, 17),
-    )  # grid of the power landscape
-    N_LAND = len(GAINS) * len(PHASES)
+    G_TRUE = g_polar(
+        0.8, 40.0
+    )  # the plant's excitation coefficient; the MPC's model has (1, 0)
     p = WECParams()
-    d = discretise(p, DT)  # nominal model: buoy, wave and cost matrices
-    env_nom = WecEnv(
-        cfg=WecEnvConfig(params=p, dt=DT, x_max=X_MAX, u_max=U_MAX)
-    )  # plant with the nominal excitation g = (1, 0)
+    d_true = discretise(p, DT).with_excitation(G_TRUE)  # the plant's matrices
+    plant = WecDynamics(d_true, p.amp)  # the true plant, batched and differentiable
     print(
         f"Inertia M = {p.M / 1e3:.1f} t, stiffness k = {p.k / 1e3:.0f} kN/m, radiation damping B = {p.B / 1e3:.1f} kNs/m"
     )
     print(
         f"Natural period {p.natural_period:.2f} s vs wave period {p.wave_period:.0f} s; "
-        f"excitation force amplitude {p.F_amp / 1e3:.0f} kN; r = {p.r:.2e} 1/(N s/m)"
+        f"excitation force amplitude {p.F_amp / 1e3:.0f} kN; r = {p.r:.2e} 1/(N s/m); "
+        f"{plant.n_per} samples per wave period"
+    )
+    _obs = plant.reset(
+        torch.zeros(3, dtype=torch.float64)
+    )  # three buoys at rest at a crest
+    _u = torch.tensor([[0.0], [1e5], [-1e5]], dtype=torch.float64)
+    _obs_next, _e = plant.step(_obs, _u)
+    print(
+        f"step: obs {tuple(_obs.shape)} and u {tuple(_u.shape)} -> obs' {tuple(_obs_next.shape)}, energy {tuple(_e.shape)}"
     )
     print(
-        f"{env_nom.n_per} samples per wave period; Phiw (rotation by omega dt) =\n{d.Phiw}"
+        f"energy of the first sample from rest for u = 0, +100 kN, -100 kN: {_e.numpy().round(1)} J "
+        "(pushing a resting buoy is motoring: negative)"
     )
-    print(
-        f"Observation space {env_nom.observation_space}, action space {env_nom.action_space}"
-    )
-    return DT, GAINS, G_NOM, G_TRUE, N, N_LAND, PHASES, U_MAX, X_MAX, d, env_nom, p
+    return DT, G_TRUE, N, U_MAX, X_MAX, d_true, p, plant
 
 
 @app.cell(hide_code=True)
@@ -192,35 +174,33 @@ def _(mo):
     mo.md(r"""
     ## 2. Baseline: a passive damper
 
-    The simplest PTO control is a linear damper $u = -c\,v$, which can only absorb power. The
-    best $c$ follows from the frequency domain (it maximises
-    $\tfrac12 c\,(1 - r c)\,|\hat F_{ex}|^2 / |Z_i + c|^2$ with the buoy impedance
-    $Z_i = B + j(\omega M - k/\omega)$) and is re-optimised for the sampled loop. It is not the
-    focus here, only the reference that every other controller is compared with.
+    The simplest PTO control is a linear damper $u = -c\,v$, which can only absorb power.
+    `optimal_damper` picks the best $c$ for the plant (from the frequency domain, refined for the
+    sampled loop). It is the reference the MPC is compared with, not the focus.
 
     `LinearController` in `wec/controller.py` is a `ParameterizedController` of leap-c-lab:
     `forward(obs, params=None, ctx=None)` maps a batch of observations to $u = -K\,\mathrm{obs}$
-    and returns `(ctx, u)`, with the gain row $K = (K_z, K_w)$ as its parameter. The damper is
-    $K = (0, c, 0, 0)$. `evaluate` in `utils.py` runs any such policy on the environment for
-    20 periods from rest and averages the last five.
+    and returns `(ctx, u)`; the damper is $K = (0, c, 0, 0)$. `evaluate` in `utils.py` runs any
+    such policy on one plant for 20 wave periods from rest and averages the power over the last
+    five.
     """)
 
 
 @app.cell
-def _(LinearController, d, env_nom, evaluate, optimal_damper, p):
-    c_pas = optimal_damper(d, p)
-    ev_pas_nom = evaluate(LinearController.damper(c_pas), env_nom)
+def _(LinearController, d_true, evaluate, optimal_damper, p, plant):
+    c_pas = optimal_damper(d_true, p)
+    ev_pas = evaluate(LinearController.damper(c_pas), plant)
     print(
-        f"Damper c = {c_pas / 1e3:.1f} kNs/m: P_e {ev_pas_nom['power'] / 1e3:.2f} kW, max|x| {ev_pas_nom['xmax']:.3f} m, "
-        f"velocity leads F_ex by {ev_pas_nom['v_phase']:.1f} deg (expected 10.07 kW, 0.419 m)"
+        f"Damper c = {c_pas / 1e3:.1f} kNs/m: P_e {ev_pas['power'] / 1e3:.2f} kW, max|x| {ev_pas['xmax']:.3f} m "
+        "(expected 6.44 kW, 0.335 m)"
     )
-    return (ev_pas_nom,)
+    return (ev_pas,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 3. Economic MPC with the nominal model
+    ## 3. Economic MPC and the cost of the wrong $g$
 
     The MPC uses the exact discrete model and cost, a wave forecast $w_k = \Phi_w^k w_0$ over
     the horizon $N = 20$ (4 s), the two constraints, and the value function of the
@@ -239,9 +219,8 @@ def _(mo):
 
     $P$ solves a discrete algebraic Riccati equation and $Y$ a Stein equation (`design_lq`).
     The stroke limit is soft because a hard bound is not recursively feasible against a
-    persistent wave. Note that the stage Hessian $W_d$ and $P$ are indefinite. The OCP is given
-    (`export_parametric_ocp` in `wec/acados_ocp.py`): acados with discrete dynamics, external
-    cost, HPIPM with the classical Riccati recursion, inputs scaled by $10^5$ N and costs by
+    persistent wave. The OCP is given (`export_parametric_ocp` in `wec/acados_ocp.py`): acados
+    with discrete dynamics, external cost and HPIPM, inputs scaled by $10^5$ N and costs by
     $10^3$ J.
 
     **Parameters in leap-c.** The OCP has two parameters. Both are registered with an
@@ -253,9 +232,9 @@ def _(mo):
     | `g` | `differentiable=True` | `p_global`, sensitivities available | tensor of shape `(B, 2)` |
     | `wave` | default, non-differentiable | stage-wise `p` | numpy array of shape `(B, N+1, 2)`, built by the planner |
 
-    A differentiable MPC layer needs at least one differentiable parameter (acados computes
-    parametric sensitivities only for `p_global`), so `g` is declared differentiable now, even
-    though this section holds it fixed.
+    `g` is the parameter we will learn. A differentiable MPC layer needs at least one
+    differentiable parameter anyway: acados computes parametric sensitivities only for
+    `p_global`.
 
     **The planner.** `WecPlanner` in `wec/planner.py` is a `ParameterizedPlanner` of leap-c-lab
     around leap-c's `AcadosDiffMpcTorch`, which generates and compiles the solver for a batch of
@@ -264,357 +243,24 @@ def _(mo):
     of plants, uses $z$ as the initial state of the OCP, builds the forecast from $w$, and
     returns `(ctx, u0, x, u, value)`: the leap-c context (solver status, iterate for warm
     starts), the first input, the predicted trajectories and the cost, with forces in Newtons.
-    `params` is the dict `{"g": ...}`; `param_space` and `default_param` describe it.
     `ControllerFromPlanner` turns the planner into a `ParameterizedController` that returns only
     `(ctx, u0)`: the MPC as a controller.
     """)
 
 
 @app.cell
-def _(
-    ControllerFromPlanner,
-    DT,
-    N,
-    N_LAND,
-    U_MAX,
-    WecPlanner,
-    WecPlannerConfig,
-    X_MAX,
-    p,
-):
+def _(ControllerFromPlanner, DT, N, U_MAX, WecPlanner, WecPlannerConfig, X_MAX, p):
     planner = WecPlanner(
         WecPlannerConfig(
-            N_horizon=N, dt=DT, x_max=X_MAX, u_max=U_MAX, params=p, n_batch_init=N_LAND
+            N_horizon=N, dt=DT, x_max=X_MAX, u_max=U_MAX, params=p, n_batch_init=16
         )
-    )
-    mpc_nom = ControllerFromPlanner(
+    )  # a batch of 16: the plants trained in parallel in Section 4
+    mpc = ControllerFromPlanner(
         planner
     )  # (obs, params, ctx) -> (ctx, u0): the MPC as a controller
     print(planner.param_manager)
     print(f"param_space {planner.param_space}, default_param {planner.default_param()}")
-    return mpc_nom, planner
-
-
-@app.cell
-def _(nn, np, torch):
-    class FixedMpcPolicy(nn.Module):
-        """u = MPC_g(obs) [N] of a compiled MPC controller for a fixed g, batched over plants."""
-
-        def __init__(self, controller, g):
-            super().__init__()
-            # Instances share one compiled solver; g is fixed, a buffer, not a parameter.
-            self.controller = controller
-            self.register_buffer("g", torch.as_tensor(np.asarray(g, dtype=float)))
-
-        def forward(self, obs, ctx=None):
-            """obs: (B, 4). Returns the leap-c context (solver status, warm start) and the PTO force (B, 1) [N]."""
-            params = {"g": self.g.expand(obs.shape[0], 2)}  # g for every plant
-            return self.controller(obs, params=params, ctx=ctx)
-
-    return (FixedMpcPolicy,)
-
-
-@app.cell
-def _(
-    ControllerFromPlanner,
-    DT,
-    FixedMpcPolicy,
-    G_NOM,
-    N,
-    N_LAND,
-    WecPlanner,
-    WecPlannerConfig,
-    d,
-    design_lq,
-    mpc_nom,
-    np,
-    p,
-    time,
-    torch,
-):
-    # Without active constraints the MPC must reproduce the LQ law u = -Kz z - Kw w for any N.
-    _unc = ControllerFromPlanner(
-        WecPlanner(
-            WecPlannerConfig(
-                N_horizon=N,
-                dt=DT,
-                x_max=np.inf,
-                u_max=np.inf,
-                params=p,
-                name="wec_unconstrained",
-                n_batch_init=4,
-            )
-        )
-    )
-    _lq = design_lq(d)
-    _rng = np.random.default_rng(2)
-    _z, _w = _rng.normal(size=(4, 2)), _rng.normal(size=(4, 2)) * 0.5
-    _obs = torch.from_numpy(np.concatenate([_z, _w], axis=1))
-    with torch.no_grad():
-        _u_mpc = FixedMpcPolicy(_unc, G_NOM)(_obs)[1]
-        _u_lq = _lq.controller(_obs)[1]
-    print(
-        f"Unconstrained MPC vs LQ law, relative difference (expected < 1e-8): "
-        f"{(_u_mpc - _u_lq).abs().max() / _u_lq.abs().max():.1e}"
-    )
-    print(
-        f"H = R + B'PB = {_lq.H:.2e} > 0, DARE residual {_lq.dare_residual:.1e}, "
-        f"closed-loop |eig| = {np.abs(_lq.cl_eigs).max():.3f}"
-    )
-    _pol = FixedMpcPolicy(mpc_nom, G_NOM)
-    _t0 = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(200):
-            _pol(_obs[:1])
-    _single = (time.perf_counter() - _t0) / 200
-    _zb, _wb = _rng.normal(size=(N_LAND, 2)), _rng.normal(size=(N_LAND, 2)) * 0.4
-    _obs_b = torch.from_numpy(np.concatenate([_zb, _wb], axis=1))
-    _t0 = time.perf_counter()
-    with torch.no_grad():
-        _pol(_obs_b)
-    _batch = (time.perf_counter() - _t0) / N_LAND
-    print(
-        f"Solve time: {1e3 * _single:.2f} ms for one OCP, {1e3 * _batch:.3f} ms per OCP in a batch of {N_LAND}"
-    )
-
-
-@app.cell
-def _(
-    FixedMpcPolicy,
-    G_NOM,
-    U_MAX,
-    X_MAX,
-    d,
-    design_lq,
-    env_nom,
-    ev_pas_nom,
-    evaluate,
-    mpc_nom,
-    plot_closed_loop,
-):
-    pol_nom = FixedMpcPolicy(mpc_nom, G_NOM)
-    _ev = {
-        "constrained MPC": evaluate(pol_nom, env_nom),
-        "LQ, unconstrained": evaluate(design_lq(d).controller, env_nom),
-        "passive damper": ev_pas_nom,
-    }
-    for _name, _e in _ev.items():
-        print(
-            f"{_name:18s} P_e {_e['power'] / 1e3:6.2f} kW  max|x| {_e['xmax']:.3f} m  max|u| {_e['umax'] / 1e3:4.0f} kN  "
-            f"v leads F_ex by {_e['v_phase']:5.1f} deg"
-        )
-    print("(expected: MPC 46.37 kW, 1.500 m, 300 kN; LQ 60.74 kW, 3.159 m, 506 kN)")
-    plot_closed_loop({k: v["log"] for k, v in _ev.items()}, X_MAX, U_MAX, env_nom.n_per)
-    return (pol_nom,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Question:** every stage Hessian $W_d$ and the terminal $P$ are indefinite, yet the QP is
-    convex and HPIPM solves it without regularisation. Why? And what does the MPC do while no
-    constraint is active?
-    """).callout(kind="info")
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## 4. The same MPC on a mismatched plant
-
-    Now the plant's excitation force is 20 % weaker and lags the wave by 40 degrees:
-    $g^\star = 0.8\,(\cos 40^\circ, \sin 40^\circ)$. `WecEnvConfig(g_ex=G_TRUE)` applies it
-    exactly, because $G(g)$ commutes with the rotation $\Phi_w$. The MPC still believes
-    $g = (1, 0)$. Evaluation is always the same: 20 periods from rest, numbers averaged over the
-    last five. For reference, the oracle is the same MPC with the true $g$ in its model.
-    """)
-
-
-@app.cell
-def _(
-    DT,
-    FixedMpcPolicy,
-    G_TRUE,
-    LinearController,
-    U_MAX,
-    WecEnv,
-    WecEnvConfig,
-    X_MAX,
-    evaluate,
-    mpc_nom,
-    optimal_damper,
-    p,
-    pol_nom,
-):
-    env_true = WecEnv(
-        cfg=WecEnvConfig(params=p, dt=DT, g_ex=tuple(G_TRUE), x_max=X_MAX, u_max=U_MAX)
-    )  # the plant: g differs from the MPC's (1, 0)
-    ev_true = {
-        "MPC, nominal model": evaluate(pol_nom, env_true),
-        "MPC, true model (oracle)": evaluate(FixedMpcPolicy(mpc_nom, G_TRUE), env_true),
-        "passive damper": evaluate(
-            LinearController.damper(optimal_damper(env_true.d, p)), env_true
-        ),
-    }
-    for _name, _e in ev_true.items():
-        print(
-            f"{_name:26s} P_e {_e['power'] / 1e3:6.2f} kW  max|x| {_e['xmax']:.3f} m  v leads F_ex by {_e['v_phase']:5.1f} deg"
-        )
-    print(
-        "(expected: nominal 25.26 kW, 1.519 m; oracle 33.56 kW, 1.500 m; damper 6.44 kW)"
-    )
-    return env_true, ev_true
-
-
-@app.cell
-def _(U_MAX, X_MAX, env_true, ev_true, mo, plot_closed_loop, plot_phasors):
-    _logs = {k: v["log"] for k, v in ev_true.items()}
-    mo.vstack(
-        [
-            plot_closed_loop(_logs, X_MAX, U_MAX, env_true.n_per),
-            plot_phasors(_logs, env_true.n_per),
-        ]
-    )
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    How bad can a wrong $g$ be? The closed-loop power of the MPC on the true plant as a function
-    of the gain and phase of *its* excitation coefficient. All 170 grid points are simulated as
-    one batch of plants (about 80 000 OCP solves): `power_landscape` calls the planner with a
-    different `g` per plant and steps the batch through `env_true.dynamics`. An occasional
-    `ACADOS_MINSTEP` line is HPIPM giving up on a step length in one of them; the solve still
-    returns a usable iterate.
-    """)
-
-
-@app.cell
-def _(mo):
-    run_land = mo.ui.run_button(label="Compute the power landscape (about 15 s)")
-    run_land
-    return (run_land,)
-
-
-@app.cell
-def _(
-    GAINS,
-    G_TRUE,
-    PHASES,
-    env_true,
-    mo,
-    np,
-    planner,
-    plot_landscape,
-    power_landscape,
-    run_land,
-):
-    mo.stop(not run_land.value)
-    land = power_landscape(planner, env_true, GAINS, PHASES)
-    _k = np.unravel_index(land["P"].argmax(), land["P"].shape)
-    _i_nom, _j_nom = np.argmin(abs(land["gain"] - 1)), np.argmin(abs(land["phase"]))
-    print(
-        f"Grid maximum {land['P'].max() / 1e3:.2f} kW at gain {land['gain'][_k[0]]:.2f}, phase {land['phase'][_k[1]]:.0f} deg "
-        f"(true coefficient 0.80, 40 deg); at the nominal model {land['P'][_i_nom, _j_nom] / 1e3:.2f} kW"
-    )
-    plot_landscape(land, G_TRUE)
-    return (land,)
-
-
-@app.cell
-def _(mo):
-    gain_s = mo.ui.slider(0.3, 1.2, step=0.05, value=1.0, label="MPC excitation gain")
-    phase_s = mo.ui.slider(
-        -10, 70, step=5, value=0, label="MPC excitation phase lag [deg]"
-    )
-    run_try = mo.ui.run_button(label="Evaluate on the true plant (800 solves)")
-    mo.vstack([mo.hstack([gain_s, phase_s]), run_try])
-    return gain_s, phase_s, run_try
-
-
-@app.cell
-def _(
-    FixedMpcPolicy,
-    env_true,
-    evaluate,
-    g_polar,
-    gain_s,
-    mo,
-    mpc_nom,
-    phase_s,
-    run_try,
-):
-    mo.stop(not run_try.value)
-    # g is a runtime parameter of the compiled solver: no recompilation when it changes.
-    _ev = evaluate(
-        FixedMpcPolicy(mpc_nom, g_polar(gain_s.value, phase_s.value)), env_true
-    )
-    print(
-        f"MPC with gain {gain_s.value:.2f}, phase {phase_s.value:.0f} deg on the true plant: "
-        f"P_e {_ev['power'] / 1e3:.2f} kW, max|x| {_ev['xmax']:.3f} m, v leads F_ex by {_ev['v_phase']:.1f} deg"
-    )
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Question:** the nominal MPC overshoots the stroke limit by only 2 cm, yet it loses a
-    quarter of the power. Where does the power go, and why does the landscape fall off much
-    faster along the phase axis than along the gain axis?
-    """).callout(kind="info")
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## 5. A differentiable plant and a differentiable MPC
-
-    Why would $g$ be wrong? The excitation force cannot be measured. It is reconstructed from a
-    wave estimate (a sensor on the buoy, a wave rider some distance up-wave, a forecast), its
-    amplitude and phase relative to the wave elevation depend on the diffraction correction of
-    the hydrodynamic model, and the buoy itself moves. At one wave frequency all of these errors
-    are a single complex number, a gain and a phase: $g$. We cannot measure $g$, but we can
-    measure what counts, the energy the plant delivers under the controller. So treat $g$ as a
-    **policy parameter** and improve it by gradient ascent on the simulated closed-loop energy.
-    That needs two things:
-
-    1. the plant as a differentiable function in PyTorch, batched over many plants that run in
-       parallel;
-    2. the MPC as a differentiable function of its parameter $g$ **and** of its initial state
-       $z_0$: the gradient must flow through the state from one step to the next. leap-c
-       provides $\partial u_0/\partial g$ and $\partial u_0/\partial z_0$ from the implicit
-       function theorem on the KKT conditions of the converged QP, reusing HPIPM's factorisation
-       (Frey et al. 2025).
-
-    ### The plant in torch
-
-    `WecDynamics` in `wec/dynamics.py` is the plant written as pure tensor functions: it stores
-    no state, the caller passes $\mathrm{obs} = (z, w)$ in and receives $(\mathrm{obs}^+, e)$,
-    and the leading dimension is a free batch of plants. The electrical energy of the sample is
-    $e = -y^\top W_d\, y$ with $y = (z, w, u)$, and $z^+ = A z + G_w w + B_u u$; rows of `obs`
-    are plants, so the matrices multiply from the right, transposed. The Gymnasium environment
-    of Section 1 steps one plant through this module under `torch.no_grad()`; the training loop
-    below calls the same module on a batch with autograd recording the whole rollout, so the
-    simulator that is differentiated is the one the results are evaluated on.
-    """)
-
-
-@app.cell
-def _(env_true, torch):
-    plant = env_true.dynamics  # the true plant, batched and differentiable
-    _obs = plant.reset(
-        torch.zeros(3, dtype=torch.float64)
-    )  # three buoys at rest at a crest
-    _u = torch.tensor([[0.0], [1e5], [-1e5]], dtype=torch.float64)
-    _obs_next, _e = plant.step(_obs, _u)
-    print(
-        f"step: obs {tuple(_obs.shape)} and u {tuple(_u.shape)} -> obs' {tuple(_obs_next.shape)}, energy {tuple(_e.shape)}"
-    )
-    print(
-        f"energy of the first sample from rest for u = 0, +100 kN, -100 kN: {_e.numpy().round(1)} J "
-        "(pushing a resting buoy is motoring: negative)"
-    )
-    return (plant,)
+    return (mpc,)
 
 
 @app.cell(hide_code=True)
@@ -622,8 +268,11 @@ def _(mo):
     mo.md(r"""
     ### The MPC as a torch module
 
-    `MpcPolicy` wraps the MPC controller of Section 3 as an `nn.Module` whose only trainable
-    parameter is `g`. Three details matter:
+    `MpcPolicy` wraps the MPC controller as an `nn.Module` whose only trainable parameter is the
+    excitation coefficient `g` of its model. The same class gives the nominal MPC
+    ($g = (1, 0)$), the oracle that knows $g^\star$, and the policy trained in Section 4. All of
+    them share the one compiled solver, because `g` is a runtime parameter. Three details
+    matter:
 
     * The planner sees `g` through the `params` dict. Pass `self.g` itself, expanded to the
       batch, not a copy: autograd must see the path from the parameter into the solver.
@@ -632,11 +281,9 @@ def _(mo):
       changes it, and leap-c raises a `ValueError` if a tensor that requires grad is passed for
       a non-differentiable parameter. The buoy state `obs[:, :2]` keeps its graph.
     * Do not pass leap-c's `discount_factor`: it rescales the stage costs by $\gamma^k$ and
-      would silently change this economic OCP. (`export_parametric_ocp` sets `cost_scaling`
-      itself, because acados otherwise multiplies stage costs by $\Delta t$.)
+      would silently change this economic OCP.
 
-    All policies share the one compiled solver of Section 3; its batch size `n_batch_init`
-    covers the number of plants trained in parallel. Complete `forward`.
+    Complete `forward`.
     """)
 
 
@@ -648,7 +295,7 @@ def _(nn, np, torch):
         def __init__(self, controller, g_init=(1.0, 0.0)):
             super().__init__()
             self.controller = controller  # (obs, params, ctx) -> (ctx, u0)
-            # The learnable excitation coefficient.
+            # The excitation coefficient of the MPC's model, learnable.
             self.g = nn.Parameter(torch.as_tensor(np.asarray(g_init, dtype=float)))
 
         def forward(self, obs, ctx=None):
@@ -660,55 +307,62 @@ def _(nn, np, torch):
     return (MpcPolicy,)
 
 
-@app.cell
-def _(MpcPolicy, mpc_nom, np, pol_nom, torch):
-    policy = MpcPolicy(mpc_nom)
-    _rng = np.random.default_rng(1)
-    _z, _w = _rng.normal(size=(8, 2)) * 0.8, _rng.normal(size=(8, 2)) * 0.4
-    _z[:4, 0] = _rng.choice([-1, 1], size=4) * _rng.uniform(
-        1.3, 1.5, size=4
-    )  # near the stroke limit
-    _obs = torch.from_numpy(np.concatenate([_z, _w], axis=1))
-    with torch.no_grad():
-        _du = (policy(_obs)[1] - pol_nom(_obs)[1]).abs().max().item()
-    print(
-        f"Trainable parameters: {sum(q.numel() for q in policy.parameters())} (expected 2)"
-    )
-    print(
-        f"MpcPolicy vs the Section 3 policy on 8 states, max |du| = {_du:.1e} N (expected < 1e-6)"
-    )
-    return (policy,)
-
-
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### Is it really differentiable?
+    ### The nominal MPC on the true plant
 
-    Roll the policy out for 20 steps on 4 plants, sum the energy, and compare the gradient with
-    respect to $g$ from autograd with central finite differences. Half of the initial states sit
-    near the stroke limit so that constraints are active along the way.
+    The MPC believes $g = (1, 0)$, the plant has $g^\star$. For reference, the **oracle** is the
+    same MPC with $g^\star$ in its model: the best this MPC can do on this plant. Every
+    controller runs on the same plant for 20 periods from rest.
     """)
 
 
 @app.cell
-def _(plant, policy, test_rollout_gradient):
-    test_rollout_gradient(policy, plant)
+def _(G_TRUE, MpcPolicy, ev_pas, evaluate, mpc, plant):
+    ev = {
+        "MPC, nominal model": evaluate(MpcPolicy(mpc), plant),  # g = (1, 0)
+        "MPC, true model (oracle)": evaluate(MpcPolicy(mpc, G_TRUE), plant),
+        "passive damper": ev_pas,
+    }
+    for _name, _e in ev.items():
+        print(f"{_name:26s} P_e {_e['power'] / 1e3:6.2f} kW  max|x| {_e['xmax']:.3f} m")
+    print(
+        "(expected: nominal 25.26 kW, 1.519 m; oracle 33.56 kW, 1.500 m; damper 6.44 kW, 0.335 m)"
+    )
+    return (ev,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    **Question:** why does the planner build the forecast from `obs[:, 2:].detach()` rather
-    than from the wave state with its graph, and why does autograd agree with finite
-    differences although the MPC, with its active-set changes, is only piecewise smooth?
-    """).callout(kind="info")
+    ## 4. Learning $g$ through the differentiable simulator
+
+    The nominal MPC loses a quarter of the oracle's power. $g$ cannot be measured, but what
+    counts can: the energy the plant delivers under the controller. So treat $g$ as a **policy
+    parameter** and improve it by gradient ascent on the simulated closed-loop energy. The plant
+    `WecDynamics` is already a differentiable torch function. The MPC must be differentiable in
+    its parameter $g$ **and** in its initial state $z_0$, because the gradient flows through the
+    state from one step to the next. leap-c provides $\partial u_0/\partial g$ and
+    $\partial u_0/\partial z_0$ from the implicit function theorem on the KKT conditions of the
+    converged QP, reusing HPIPM's factorisation (Frey et al. 2025).
+
+    **Is it really differentiable?** Roll the policy out for 20 steps on 4 plants, sum the
+    energy, and compare the gradient with respect to $g$ from autograd with central finite
+    differences. Half of the initial states sit near the stroke limit so that constraints are
+    active along the way.
+    """)
+
+
+@app.cell
+def _(MpcPolicy, mpc, plant, test_rollout_gradient):
+    test_rollout_gradient(MpcPolicy(mpc), plant)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 6. Learning with SHAC and truncated BPTT
+    ### Short-horizon actor-critic (SHAC)
 
     **Objective.** Maximise the discounted closed-loop return of $n$ plants started from random
     wave phases and random buoy states,
@@ -722,40 +376,32 @@ def _(mo):
     $\rho = 10^8$ J/m² keeps the learned controller inside the stroke that the MPC's soft
     constraint promises.
 
-    **Pathwise gradient over a short window.** Simulator and policy are differentiable, so the
-    gradient of a window of $h$ steps is one `backward()` through $h$ plant steps and $h$ MPC
-    solves: no action noise, no likelihood ratio. The loss of one iteration is
+    **Loss.** Simulator and policy are differentiable, so the gradient of a window of $h$ steps
+    is one `backward()` through $h$ plant steps and $h$ MPC solves: no action noise, no
+    likelihood ratio. SHAC (Xu et al. 2022) closes the window with a learned value $V_\phi$:
 
     $$
     L(g) = -\frac{1}{h}\,\frac{1}{n}\sum_{i=1}^{n}\Big[\sum_{t=0}^{h-1}\gamma^t r_t^{(i)}
       + \gamma^h\, V_\phi\big(s_h^{(i)}\big)\Big].
     $$
 
-    Without the last term this is **truncated back-propagation through time**: the plants keep
-    running across iterations, but the graph is cut every $h$ steps with `detach`. The bias of
-    the truncation is the value of the state the window leaves behind. Here that is the energy
-    stored in the moving buoy, $\tfrac12 k x^2 + \tfrac12 M v^2 \approx 200$ kJ, against a net
-    yield of about 50 kJ per step: a 10-step window is rewarded for *not* storing energy, which
-    means a small excitation gain.
-
-    **SHAC** (short-horizon actor-critic, Xu et al. 2022) closes the window with a learned
-    value $V_\phi(s_h)$. The critic is a small MLP on the scaled state $s = (z, w)$, fitted by
-    regression to TD($\lambda$) returns of the same rollouts,
+    The plants keep running across iterations, but the graph is cut every $h$ steps with
+    `detach`. Without the value term the window would ignore the energy stored in the moving
+    buoy (about 200 kJ, against a net yield of about 50 kJ per step) and reward *not* storing
+    it. The critic is a small MLP on the scaled state $s = (z, w)$, fitted by regression to
+    TD($\lambda$) returns of the same rollouts,
 
     $$
     G_t = r_t + \gamma\big[(1 - \lambda)\, V_{\bar\phi}(s_{t+1}) + \lambda\, G_{t+1}\big],
     \qquad G_h = V_{\bar\phi}(s_h),
     $$
 
-    with a slowly moving target network $\bar\phi$. An untrained critic would leave exactly the
+    with a slowly moving target network $\bar\phi$. An untrained critic would give the
     truncated gradient, so the first `critic_warmup` iterations fit the critic only.
 
     **Batching and exploration.** The $n$ plants are one batch of the acados solver: one call
-    `policy(obs)` solves $n$ OCPs in parallel. There is no action noise. Diversity comes from
-    the random wave phases and buoy states at the restarts every `episode_len` steps, which also
-    keep the critic trained on states off the current limit cycle. Gaussian noise on the force
-    was tried and made SHAC collapse: it adds $r u^2$ losses and noise to the critic's targets
-    without informing the gradient.
+    `policy(obs)` solves $n$ OCPs in parallel. There is no action noise; diversity comes from
+    the random wave phases and buoy states at the restarts every `episode_len` steps.
 
     `ShacConfig` in `utils.py` collects the settings. Complete `reward`, `td_lambda_targets` and
     the two marked lines of `train`, then read the loop: it is the whole pipeline.
@@ -811,7 +457,7 @@ def _(td_lambda_targets, torch):
 @app.cell
 def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
     def train(policy, plant, cfg, callback=None):
-        """SHAC (cfg.critic) or truncated BPTT. Trains policy.parameters() in place; returns a log per iteration."""
+        """SHAC. Trains policy.parameters() in place; returns a log per iteration."""
         torch.manual_seed(cfg.seed)
         omega = float(torch.atan2(plant.Phiw[1, 0], plant.Phiw[0, 0])) / plant.dt
         scale = torch.tensor(
@@ -827,7 +473,6 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
         decay = torch.optim.lr_scheduler.LinearLR(
             opt_actor, 1.0, 0.1, total_iters=cfg.iters
         )
-        warmup = cfg.critic_warmup if cfg.critic else 0
 
         def restart():  # every plant: random wave phase, random buoy state
             obs = plant.reset(2 * np.pi * torch.rand(cfg.n_env, dtype=torch.float64))
@@ -840,7 +485,7 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 
         obs = restart()
         steps, log = 0, []
-        for it in range(-warmup, cfg.iters):
+        for it in range(-cfg.critic_warmup, cfg.iters):
             if steps >= cfg.episode_len:
                 obs, steps = restart(), 0
             # The window starts here: the graph of earlier steps is cut.
@@ -852,14 +497,12 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
                 obs_log.append(obs / scale)
                 ctx, u = policy(obs)
                 failed += int((ctx.status != 0).sum())
-                if cfg.action_noise > 0:
-                    u = u + cfg.action_noise * torch.randn_like(u)
                 obs, energy = plant.step(obs, u)
                 rews.append(reward(energy, obs[:, 0], cfg))
                 ret = ret + cfg.gamma**t * rews[-1]
             obs_log.append(obs / scale)
-            if cfg.critic:  # Bootstrap with the target critic.
-                ret = ret + ...  # TODO: add the target critic's value of the last obs.
+            # Bootstrap with the target critic.
+            ret = ret + ...  # TODO: add the target critic's value of the last obs.
             loss = -ret.mean() / cfg.horizon
             steps += cfg.horizon
             if it >= 0:  # warm-up iterations train the critic only
@@ -869,31 +512,27 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
                 opt_actor.step()
                 decay.step()
 
-            critic_loss = float("nan")
-            if cfg.critic:
-                with torch.no_grad():  # regression targets from the same rollout
-                    O, R = torch.stack(obs_log), torch.stack(rews)
-                    targets = td_lambda_targets(
-                        R, target(O[1:]).squeeze(-1), cfg.gamma, cfg.lam
-                    )
-                    X, Yt = O[:-1].reshape(-1, 4), targets.reshape(-1)
-                for _ in range(cfg.critic_epochs):
-                    critic_loss = torch.nn.functional.mse_loss(
-                        critic(X).squeeze(-1), Yt
-                    )
-                    opt_critic.zero_grad()
-                    critic_loss.backward()
-                    opt_critic.step()
-                critic_loss = critic_loss.item()
-                with torch.no_grad():  # Polyak update of the target critic
-                    for pt, pc in zip(target.parameters(), critic.parameters()):
-                        pt.mul_(cfg.target_alpha).add_((1 - cfg.target_alpha) * pc)
+            with torch.no_grad():  # regression targets from the same rollout
+                O, R = torch.stack(obs_log), torch.stack(rews)
+                targets = td_lambda_targets(
+                    R, target(O[1:]).squeeze(-1), cfg.gamma, cfg.lam
+                )
+                X, Yt = O[:-1].reshape(-1, 4), targets.reshape(-1)
+            for _ in range(cfg.critic_epochs):
+                critic_loss = torch.nn.functional.mse_loss(critic(X).squeeze(-1), Yt)
+                opt_critic.zero_grad()
+                critic_loss.backward()
+                opt_critic.step()
+            critic_loss = critic_loss.item()
+            with torch.no_grad():  # Polyak update of the target critic
+                for pt, pc in zip(target.parameters(), critic.parameters()):
+                    pt.mul_(cfg.target_alpha).add_((1 - cfg.target_alpha) * pc)
 
             if it < 0:
                 continue
             entry = dict(
                 it=it + 1,
-                env_steps=(warmup + it + 1) * cfg.horizon * cfg.n_env,
+                env_steps=(cfg.critic_warmup + it + 1) * cfg.horizon * cfg.n_env,
                 loss=loss.item(),
                 grad_norm=grad_norm,
                 critic_loss=critic_loss,
@@ -911,214 +550,97 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    **Question:** DDPG in Exercise 06 needed exploration noise on the action. Why does this
-    method not, and what plays the role of exploration here?
-    """).callout(kind="info")
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    Three runs: SHAC with a 10-step window, long-window BPTT without a critic as the
-    reference, and the same 10-step window without a critic. Every run starts from the nominal
-    $g = (1, 0)$ and is evaluated every 10 iterations with the 20-period closed loop of
-    Section 4. About 30 s per run on a laptop CPU; the iteration budget can be reduced.
+    Train from the nominal $g = (1, 0)$ with the defaults of `ShacConfig`: 16 plants, $h = 10$,
+    50 critic warm-up iterations and 300 actor updates. Every 10 iterations the MPC is evaluated
+    with the closed loop of Section 3. About 35 s on a laptop CPU.
     """)
 
 
 @app.cell
-def _(C_BPTT, C_SHAC, C_SHORT, mo):
-    RUNS = {  # name -> (label, colour, ShacConfig overrides)
-        "shac": (
-            "SHAC, h = 10, critic",
-            C_SHAC,
-            dict(horizon=10, n_env=16, iters=300, actor_lr=0.01),
-        ),
-        "bptt": (
-            "BPTT, h = 80, no critic",
-            C_BPTT,
-            dict(horizon=80, n_env=8, iters=120, critic=False, gamma=1.0),
-        ),
-        "short": (
-            "truncated BPTT, h = 10, no critic",
-            C_SHORT,
-            dict(horizon=10, n_env=16, iters=300, actor_lr=0.01, critic=False),
-        ),
-    }
-    selected = mo.ui.multiselect(options=list(RUNS), value=list(RUNS), label="Runs")
-    budget = mo.ui.slider(
-        0.25,
-        1.0,
-        step=0.25,
-        value=1.0,
-        label="Iteration budget (fraction of the default)",
+def _(MpcPolicy, ShacConfig, X_MAX, mpc, plant, summarize, time, train):
+    _cfg = ShacConfig(x_max=X_MAX)
+    pol_shac = MpcPolicy(mpc)  # fresh start at g = (1, 0), the shared solver
+    _start = summarize(pol_shac, plant)
+    _t0 = time.time()
+    shac_log = train(
+        pol_shac,
+        plant,
+        _cfg,
+        lambda it, pol: summarize(pol, plant) if it % 10 == 0 else {},
     )
-    run_train = mo.ui.run_button(label="Train")
-    mo.vstack([mo.hstack([selected, budget]), run_train])
-    return RUNS, budget, run_train, selected
-
-
-@app.cell
-def _(
-    MpcPolicy,
-    RUNS,
-    ShacConfig,
-    X_MAX,
-    budget,
-    env_true,
-    mo,
-    mpc_nom,
-    plant,
-    run_train,
-    selected,
-    summarize,
-    time,
-    train,
-):
-    mo.stop(not run_train.value)
-    runs = {}
-    for _name in selected.value:
-        _label, _color, _over = RUNS[_name]
-        _cfg = ShacConfig(
-            x_max=X_MAX,
-            **dict(_over, iters=max(10, int(budget.value * _over["iters"]))),
-        )
-        _pol = MpcPolicy(mpc_nom)  # fresh start at g = (1, 0), the shared solver
-        _start = summarize(_pol, env_true)
-        _t0 = time.time()
-        _log = train(
-            _pol,
-            plant,
-            _cfg,
-            lambda it, pol: summarize(pol, env_true) if it % 10 == 0 else {},
-        )
-        _wall = time.time() - _t0
-        _log.insert(0, dict(it=0, env_steps=0, **_start))
-        runs[_name] = dict(
-            label=_label,
-            color=_color,
-            log=_log,
-            final=summarize(_pol, env_true),
-            policy=_pol,
-            wall=_wall,
-            failures=sum(e["solver_failures"] for e in _log[1:]),
-        )
-        print(
-            f"-- {_label}: {_cfg.iters} iterations, {_log[-1]['env_steps']} environment steps, "
-            f"{_wall:.0f} s, {runs[_name]['failures']} solver failures"
-        )
-        for _e in _log:
-            if "power" in _e:
-                print(
-                    f"   it {_e['it']:4d}  steps {_e['env_steps']:6d}  P_e {_e['power'] / 1e3:6.2f} kW  "
-                    f"max|x| {_e['xmax']:.3f} m  gain {_e['gain']:.3f}  phase {_e['phase']:5.1f} deg"
-                )
-    return (runs,)
+    _wall = time.time() - _t0
+    shac_log.insert(0, dict(it=0, env_steps=0, **_start))
+    print(
+        f"SHAC: {_cfg.iters} iterations, {shac_log[-1]['env_steps']} environment steps, {_wall:.0f} s, "
+        f"{sum(e['solver_failures'] for e in shac_log[1:])} solver failures"
+    )
+    for _e in shac_log:
+        if "power" in _e:
+            print(
+                f"   it {_e['it']:4d}  steps {_e['env_steps']:6d}  P_e {_e['power'] / 1e3:6.2f} kW  "
+                f"max|x| {_e['xmax']:.3f} m  gain {_e['gain']:.3f}  phase {_e['phase']:5.1f} deg"
+            )
+    return pol_shac, shac_log
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 7. Results
+    ## 5. Results
 
-    Steady-state power of every controller on the true plant, and how much of the gap between
-    the nominal MPC and the oracle each run recovers. The landscape figure needs the button of
-    Section 4 to have been pressed once.
+    Steady-state power of every controller on the plant, and how much of the gap between the
+    nominal MPC and the oracle the training recovers.
     """)
 
 
 @app.cell
-def _(G_TRUE, ev_true, mo, polar, result_table, runs):
+def _(G_TRUE, ev, mo, polar, result_table, shac_log):
+    _nom, _orc, _pas = (
+        ev["MPC, nominal model"],
+        ev["MPC, true model (oracle)"],
+        ev["passive damper"],
+    )
+    _fin = shac_log[-1]
     _rows = [
+        ("MPC, nominal model", _nom["power"], _nom["xmax"], 1.0, 0.0),
         (
-            "MPC, nominal model",
-            ev_true["MPC, nominal model"]["power"],
-            ev_true["MPC, nominal model"]["xmax"],
-            1.0,
-            0.0,
-        )
-    ]
-    _rows += [
-        (
-            f"MPC trained by {r['label']}",
-            r["final"]["power"],
-            r["final"]["xmax"],
-            r["final"]["gain"],
-            r["final"]["phase"],
-        )
-        for r in runs.values()
-    ]
-    _rows += [
-        (
-            "MPC, true model (oracle)",
-            ev_true["MPC, true model (oracle)"]["power"],
-            ev_true["MPC, true model (oracle)"]["xmax"],
-            *polar(G_TRUE),
+            "MPC trained by SHAC",
+            _fin["power"],
+            _fin["xmax"],
+            _fin["gain"],
+            _fin["phase"],
         ),
-        (
-            "passive damper",
-            ev_true["passive damper"]["power"],
-            ev_true["passive damper"]["xmax"],
-            None,
-            None,
-        ),
+        ("MPC, true model (oracle)", _orc["power"], _orc["xmax"], *polar(G_TRUE)),
+        ("passive damper", _pas["power"], _pas["xmax"], None, None),
     ]
     mo.md(
-        result_table(
-            _rows,
-            ev_true["MPC, nominal model"]["power"],
-            ev_true["MPC, true model (oracle)"]["power"],
-        )
-        + "\n\n(expected: SHAC about 32.7 kW and 90 %, BPTT 33.5 kW and 99 %, truncated BPTT collapses to about 8.6 kW)"
+        result_table(_rows, _nom["power"], _orc["power"])
+        + "\n\n(expected: SHAC about 32.7 kW and 90 % of the gap)"
     )
 
 
 @app.cell
-def _(G_TRUE, ev_true, land, plot_training, runs):
+def _(G_TRUE, ev, plot_training, shac_log):
     plot_training(
-        runs,
-        ev_true["MPC, nominal model"]["power"],
-        ev_true["MPC, true model (oracle)"]["power"],
+        shac_log,
+        ev["MPC, nominal model"]["power"],
+        ev["MPC, true model (oracle)"]["power"],
         G_TRUE,
-        land,
     )
 
 
 @app.cell
-def _(
-    U_MAX, X_MAX, env_true, ev_true, evaluate, mo, plot_closed_loop, plot_phasors, runs
-):
-    _best = max(runs, key=lambda k: runs[k]["final"]["power"])
-    _logs = {
-        "MPC, nominal model": ev_true["MPC, nominal model"]["log"],
-        f"trained by {runs[_best]['label']}": evaluate(runs[_best]["policy"], env_true)[
-            "log"
-        ],
-        "MPC, true model (oracle)": ev_true["MPC, true model (oracle)"]["log"],
-    }
-    mo.vstack(
-        [
-            plot_closed_loop(_logs, X_MAX, U_MAX, env_true.n_per),
-            plot_phasors(_logs, env_true.n_per),
-        ]
+def _(U_MAX, X_MAX, ev, evaluate, plant, plot_closed_loop, pol_shac):
+    plot_closed_loop(
+        {
+            "MPC, nominal model": ev["MPC, nominal model"]["log"],
+            "MPC trained by SHAC": evaluate(pol_shac, plant)["log"],
+            "MPC, true model (oracle)": ev["MPC, true model (oracle)"]["log"],
+        },
+        X_MAX,
+        U_MAX,
+        plant.n_per,
     )
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Question:** SHAC ends near gain 0.48 and BPTT near 0.66, while the plant has 0.8, yet
-    both recover 90 to 99 % of the power. Has the learning identified the plant?
-    """).callout(kind="info")
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    **Question:** truncated BPTT with $h = 10$ follows the right direction for about 70
-    iterations and then collapses to $g \approx 0$. What is the mechanism, and which two
-    ingredients keep SHAC's equally short window honest?
-    """).callout(kind="info")
 
 
 if __name__ == "__main__":

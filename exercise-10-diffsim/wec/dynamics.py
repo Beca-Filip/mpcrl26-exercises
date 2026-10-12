@@ -179,6 +179,7 @@ class WecDynamics(nn.Module):
             self.register_buffer(name, torch.from_numpy(getattr(d, name)))
         self.register_buffer("Bu", torch.from_numpy(d.Bu[:, 0]))
         self.amp, self.dt = amp, d.dt
+        self.n_per = int(round(2 * np.pi / np.arctan2(d.Phiw[1, 0], d.Phiw[0, 0])))   # samples per wave period
 
     def reset(self, phase: torch.Tensor) -> torch.Tensor:
         """Buoys at rest, waves eta = A cos(omega t + phase) for a batch of phases (B,). Returns obs (B, 4)."""
