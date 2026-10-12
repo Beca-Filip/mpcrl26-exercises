@@ -213,7 +213,15 @@ def _(AcadosDiffMpcTorch, setup_ocp_with_manager, torch):
     # Obtain the batched gradient du0/dp of shape (batch_size, 1)
     u0.sum().backward()
     du0_dp = p_values.grad
-    return ctx, du0_dp, p_values, u0
+    return controller_layer, ctx, du0_dp, p_values, u0
+
+
+@app.cell
+def _(controller_layer, ctx):
+    # General way to compute the Jacobian - leap-c notebooks on HuggingFace contain more info
+    alternative_jacobian = controller_layer.diff_mpc_fun.sensitivity(ctx, "du0_dp_global") # KEY!!!!!!!!!!!!!!!! << GENERAL JACOBIAN OF U_0 W.R.T. P
+    print(alternative_jacobian.shape)
+    return
 
 
 @app.cell(hide_code=True)
