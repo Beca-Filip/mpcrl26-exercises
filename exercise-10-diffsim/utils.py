@@ -1,272 +1,34 @@
-"""Domain code for Exercise 10: a heaving wave energy converter (WEC), its energy-maximising LQ
-design, the economic MPC as an acados OCP, evaluation helpers and plots.
+"""Helpers for Exercise 10 that are not part of the `wec` package: closed-loop evaluation of a
+policy on the Gymnasium environment, the power landscape, the training configuration, the
+gradient check, result table and plots.
 
-Everything here is given. The notebook only touches the differentiable plant, the leap-c
-parameter handling, the loss and the training loop. Vendored from the wec-lq prototype.
-
-Conventions
-    y = [x, v, w1, w2, u]: buoy state z = (x, v), wave state w = A (cos, sin)(omega t), PTO force u
-    acting on the buoy. Electrical power P_e = -u v - r u^2; the controller minimises l = -P_e.
-    Excitation coefficient g = (g1, g2): F_ex = Gamma (g1 w1 + g2 w2); g = gain (cos phi, sin phi)
-    scales the force by gain and lags it by phi; (1, 0) is the nominal model.
+A policy is anything with the call signature of a `ParameterizedController` without parameters,
+    ctx, u = policy(obs, ctx=None)
+for a batch of observations obs (B, 4) = [x, v, w1, w2] and PTO forces u (B, 1) in Newtons:
+`LinearController`, or the notebook's `FixedMpcPolicy` and `MpcPolicy` around the MPC controller.
 """
 
-from dataclasses import dataclass, replace
-from typing import Callable
+from dataclasses import dataclass
 
-import casadi as ca
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from acados_template import AcadosOcp
-from scipy.linalg import expm, solve_discrete_are
-from scipy.optimize import minimize_scalar
 
-# --------------------------------------------------------------------------- parameters
-RHO, G_ACC = 1025.0, 9.81   # sea water density [kg/m^3], gravity [m/s^2]
+from wec import WecDynamics, WecEnv, WecPlanner, g_polar, polar
 
-
-@dataclass(frozen=True)
-class WECParams:
-    """Hemispherical buoy in a regular wave. Illustrative long-wave hydrodynamic coefficients."""
-    radius: float = 2.5              # hemisphere radius = draft [m]
-    wave_period: float = 8.0         # regular wave period [s]
-    wave_height: float = 1.0         # crest-to-trough height [m]
-    added_mass_ratio: float = 0.75   # m_a / m at the wave frequency
-    eps_loss: float = 0.05           # copper-loss factor eps = r |Z_i(omega)|
-
-    @property
-    def omega(self) -> float:
-        return 2 * np.pi / self.wave_period
-
-    @property
-    def amp(self) -> float:
-        return self.wave_height / 2
-
-    @property
-    def m(self) -> float:
-        return RHO * 2 / 3 * np.pi * self.radius**3
-
-    @property
-    def m_a(self) -> float:
-        return self.added_mass_ratio * self.m
-
-    @property
-    def M(self) -> float:
-        """Total inertia m + m_a."""
-        return self.m + self.m_a
-
-    @property
-    def k(self) -> float:
-        """Hydrostatic stiffness rho g A_w."""
-        return RHO * G_ACC * np.pi * self.radius**2
-
-    @property
-    def gamma(self) -> float:
-        """Excitation coefficient F_ex = gamma eta (Froude-Krylov, long waves)."""
-        return self.k
-
-    @property
-    def B(self) -> float:
-        """Radiation damping from the Haskind relation."""
-        return self.gamma**2 * self.omega**3 / (2 * RHO * G_ACC**3)
-
-    @property
-    def natural_period(self) -> float:
-        return 2 * np.pi / np.sqrt(self.k / self.M)
-
-    @property
-    def Zi(self) -> complex:
-        """Intrinsic impedance B + j(omega M - k/omega) at the wave frequency."""
-        return self.B + 1j * (self.omega * self.M - self.k / self.omega)
-
-    @property
-    def r(self) -> float:
-        """Copper-loss coefficient: P_loss = r u^2."""
-        return self.eps_loss / abs(self.Zi)
-
-    @property
-    def F_amp(self) -> float:
-        """Excitation force amplitude [N]."""
-        return self.gamma * self.amp
-
-
-# --------------------------------------------------------------------------- model
-IX, IV, IW1, IW2, IU = range(5)   # index map into y
-
-
-def continuous_model(p: WECParams) -> tuple[np.ndarray, np.ndarray]:
-    """Generator F (5x5) of y' = F y and cost weight W (5x5) of l = u v + r u^2 = y' W y."""
-    F = np.zeros((5, 5))
-    F[IX, IV] = 1.0
-    F[IV, IX] = -p.k / p.M
-    F[IV, IV] = -p.B / p.M
-    F[IV, IW1] = p.gamma / p.M
-    F[IV, IU] = 1.0 / p.M
-    F[IW1, IW2] = -p.omega
-    F[IW2, IW1] = p.omega
-    W = np.zeros((5, 5))
-    W[IV, IU] = W[IU, IV] = 0.5
-    W[IU, IU] = p.r
-    return F, W
-
-
-def excitation_matrix(g) -> np.ndarray:
-    """G(g) = [[g1, g2], [-g2, g1]]: the complex excitation coefficient acting on the wave state."""
-    return np.array([[g[0], g[1]], [-g[1], g[0]]], dtype=float)
-
-
-@dataclass(frozen=True)
-class DiscreteModel:
-    """z+ = A z + Gw w + Bu u,  w+ = Phiw w,  sum_k y_k' Wd y_k = integral of l (exact ZOH)."""
-    A: np.ndarray      # 2x2
-    Bu: np.ndarray     # 2x1
-    Gw: np.ndarray     # 2x2
-    Phiw: np.ndarray   # 2x2 rotation by omega dt
-    Wd: np.ndarray     # 5x5 exact integrated cost over one sample
-    dt: float
-
-    @property
-    def Qzz(self): return self.Wd[:2, :2]
-    @property
-    def Qzw(self): return self.Wd[:2, 2:4]
-    @property
-    def Nz(self): return self.Wd[:2, 4:5]
-    @property
-    def Nw(self): return self.Wd[2:4, 4:5]
-    @property
-    def R(self): return self.Wd[4:5, 4:5]
-
-    def with_excitation(self, g) -> "DiscreteModel":
-        """Model with F_ex = Gamma (g1 w1 + g2 w2). Exact because G(g) commutes with Phiw."""
-        T = np.eye(5)
-        T[2:4, 2:4] = excitation_matrix(g)
-        return replace(self, Gw=self.Gw @ T[2:4, 2:4], Wd=T.T @ self.Wd @ T)
-
-
-def discretise(p: WECParams, dt: float) -> DiscreteModel:
-    """Exact ZOH discretisation of dynamics and integrated stage cost (Van Loan, 1978)."""
-    F, W = continuous_model(p)
-    n = F.shape[0]
-    E = expm(np.block([[-F.T, W], [np.zeros((n, n)), F]]) * dt)
-    Phi = E[n:, n:]
-    Wd = Phi.T @ E[:n, n:]
-    Wd = 0.5 * (Wd + Wd.T)
-    return DiscreteModel(A=Phi[:2, :2], Bu=Phi[:2, 4:5], Gw=Phi[:2, 2:4],
-                         Phiw=Phi[2:4, 2:4], Wd=Wd, dt=dt)
-
-
-# --------------------------------------------------------------------------- LQ design
-@dataclass(frozen=True)
-class LinearPolicy:
-    """u = -Kz z - Kw w. Kw = 0 gives pure state feedback (e.g. a passive damper)."""
-    Kz: np.ndarray   # 1x2
-    Kw: np.ndarray   # 1x2
-
-    def __call__(self, z: np.ndarray, w: np.ndarray) -> float:
-        return float(-(self.Kz @ z + self.Kw @ w)[0])
-
-    @classmethod
-    def damper(cls, c: float) -> "LinearPolicy":
-        return cls(np.array([[0.0, c]]), np.zeros((1, 2)))
-
-
-@dataclass(frozen=True)
-class LQDesign:
-    policy: LinearPolicy
-    P: np.ndarray            # 2x2 Riccati solution (indefinite in general)
-    Y: np.ndarray            # 2x2 buoy-wave coupling of the value function
-    H: float                 # R + B'PB, must be > 0
-    dare_residual: float     # relative residual of the DARE
-    cl_eigs: np.ndarray      # eigenvalues of A - B Kz
-
-
-def _solve_stein(Acl: np.ndarray, Phiw: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Solve Y - Acl' Y Phiw = rhs."""
-    n, m = rhs.shape
-    L = np.eye(n * m) - np.kron(Phiw.T, Acl.T)
-    return np.linalg.solve(L, rhs.flatten(order="F")).reshape((n, m), order="F")
-
-
-def design_lq(d: DiscreteModel) -> LQDesign:
-    """Average-cost LQ with the indefinite energy cost: DARE on z, Stein equation for Y."""
-    A, B, Gw, Phiw = d.A, d.Bu, d.Gw, d.Phiw
-    P = solve_discrete_are(A, B, d.Qzz, d.R, s=d.Nz)
-    H = d.R + B.T @ P @ B
-    Kz = np.linalg.solve(H, B.T @ P @ A + d.Nz.T)
-    res = d.Qzz + A.T @ P @ A - (A.T @ P @ B + d.Nz) @ Kz - P
-    Acl = A - B @ Kz
-    Y = _solve_stein(Acl, Phiw, d.Qzw + Acl.T @ P @ Gw - Kz.T @ d.Nw.T)
-    Kw = np.linalg.solve(H, B.T @ P @ Gw + B.T @ Y @ Phiw + d.Nw.T)
-    return LQDesign(policy=LinearPolicy(Kz, Kw), P=P, Y=Y, H=float(H[0, 0]),
-                    dare_residual=float(np.abs(res).max() / np.abs(P).max()),
-                    cl_eigs=np.linalg.eigvals(Acl))
-
-
-def mean_power(d: DiscreteModel, pol: LinearPolicy, amp: float) -> float:
-    """Exact mean electrical power [W] of a linear policy in periodic steady state."""
-    Acl = d.A - d.Bu @ pol.Kz
-    L = np.kron(d.Phiw.T, np.eye(2)) - np.kron(np.eye(2), Acl)
-    T = np.linalg.solve(L, (d.Gw - d.Bu @ pol.Kw).flatten(order="F")).reshape((2, 2), order="F")
-    Xi = np.vstack([T, np.eye(2), -(pol.Kz @ T + pol.Kw)])
-    return float(-(amp**2 / 2) * np.trace(Xi.T @ d.Wd @ Xi) / d.dt)
-
-
-def optimal_damper(d: DiscreteModel, p: WECParams) -> float:
-    """Best sampled passive damper u = -c v for the plant d, judged with the exact cost."""
-    F, Z, r = p.F_amp, p.Zi, p.r
-    guess = minimize_scalar(lambda c: -0.5 * c * (1 - r * c) * F**2 / abs(Z + c) ** 2,
-                            bounds=(0, 1 / r), method="bounded").x   # continuous-time optimum
-    res = minimize_scalar(lambda c: -mean_power(d, LinearPolicy.damper(c), p.amp),
-                          bounds=(0.2 * guess, 2.0 * guess), method="bounded",
-                          options=dict(xatol=1e-6 * guess))
-    return float(res.x)
-
-
-# --------------------------------------------------------------------------- numpy plant
-Policy = Callable[[np.ndarray, np.ndarray], float]
-
-
-class RegularWaveWEC:
-    """Exact sampled-data simulator: buoy + regular wave, ZOH PTO force, exact energy accounting.
-
-    Full information: buoy state z = [x, v] and wave state w = [w1, w2], eta = w1.
-    g_ex is the plant's excitation coefficient (see DiscreteModel.with_excitation).
-    """
-
-    def __init__(self, p: WECParams, dt: float, g_ex=(1.0, 0.0)):
-        self.p = p
-        self.g_ex = np.asarray(g_ex, dtype=float)
-        self.d: DiscreteModel = discretise(p, dt).with_excitation(self.g_ex)
-        self.n_per = int(round(p.wave_period / dt))   # samples per wave period
-        self.reset()
-
-    def reset(self) -> tuple[np.ndarray, np.ndarray]:
-        self.z = np.zeros(2)
-        self.w = self.p.amp * np.array([1.0, 0.0])
-        self.t = 0.0
-        return self.z.copy(), self.w.copy()
-
-    def step(self, u: float) -> tuple[np.ndarray, np.ndarray, float]:
-        """Advance one sample. Returns (z, w, electrical energy delivered over the step [J])."""
-        y = np.concatenate([self.z, self.w, [u]])
-        energy = -float(y @ self.d.Wd @ y)
-        self.z = self.d.A @ self.z + self.d.Gw @ self.w + self.d.Bu[:, 0] * u
-        self.w = self.d.Phiw @ self.w
-        self.t += self.d.dt
-        return self.z.copy(), self.w.copy(), energy
-
-
-def simulate(env: RegularWaveWEC, policy: Policy, n_steps: int) -> dict[str, np.ndarray]:
-    """Closed-loop rollout from rest. Pe[i] is the mean electrical power over sample i [W]."""
-    z, w = env.reset()
+# --------------------------------------------------------------------------- closed loop
+def simulate(env: WecEnv, policy, n_steps: int) -> dict[str, np.ndarray]:
+    """Closed-loop rollout from rest, one solve per step and no warm start. Pe[i] is the mean
+    electrical power over sample i [W]."""
+    obs, _ = env.reset()
     log = {k: np.zeros(n_steps) for k in ("t", "x", "v", "u", "Fex", "Pe")}
     for i in range(n_steps):
-        u = policy(z, w)
-        log["t"][i], log["x"][i], log["v"][i] = env.t, z[0], z[1]
-        log["u"][i], log["Fex"][i] = u, env.p.gamma * (env.g_ex @ w)
-        z, w, e = env.step(u)
-        log["Pe"][i] = e / env.d.dt
+        with torch.no_grad():
+            _, a = policy(torch.from_numpy(obs)[None])
+        u = float(a[0, 0])
+        log["x"][i], log["v"][i], log["u"][i] = obs[0], obs[1], u
+        obs, _, _, _, info = env.step(np.array([u]))
+        log["t"][i], log["Fex"][i], log["Pe"][i] = info["t"], info["Fex"], info["Pe"]
     return log
 
 
@@ -286,112 +48,28 @@ def phase_deg(ref: np.ndarray, sig: np.ndarray, n_per: int) -> float:
     return float(np.degrees(np.angle(fundamental(sig, n_per) / fundamental(ref, n_per))))
 
 
-def evaluate(policy: Policy, env: RegularWaveWEC, periods: int = 20) -> dict:
-    """Closed loop from rest; steady-state numbers are means over the last 5 periods."""
+def evaluate(policy, env: WecEnv, periods: int = 20) -> dict:
+    """Closed loop of a policy on the environment from rest; steady-state numbers are means over
+    the last 5 periods."""
     log = simulate(env, policy, periods * env.n_per)
     return dict(power=steady_mean(log["Pe"], env.n_per), xmax=float(np.abs(log["x"]).max()),
                 umax=float(np.abs(log["u"]).max()),
                 v_phase=phase_deg(log["Fex"], log["v"], env.n_per), log=log)
 
 
-# --------------------------------------------------------------------------- excitation coefficient
-def g_polar(gain: float, phase_deg: float) -> np.ndarray:
-    """g = gain (cos phi, sin phi): excitation force scaled by gain and lagging by phi."""
-    return gain * np.array([np.cos(np.radians(phase_deg)), np.sin(np.radians(phase_deg))])
-
-
-def polar(g) -> tuple[float, float]:
-    """(gain, phase lag [deg]) of an excitation coefficient g."""
-    g = np.asarray(g, dtype=float)
-    return float(np.hypot(g[0], g[1])), float(np.degrees(np.arctan2(g[1], g[0])))
-
-
-# --------------------------------------------------------------------------- acados OCP
-U_SCALE = 1e5   # the OCP decides u / U_SCALE   [1e5 N]
-J_SCALE = 1e3   # and minimises energy / J_SCALE [kJ]
-
-
-def make_ocp(d: DiscreteModel, N: int, g, wave, x_max: float = np.inf, u_max: float = np.inf,
-             slack_l1: float = 1e6, slack_l2: float = 1e8, name: str = "wec_mpc") -> AcadosOcp:
-    """Economic MPC of the WEC as an acados OCP with the LQ value function as terminal cost.
-
-    g, wave: CasADi symbols from an AcadosParameterManager: the MPC's excitation coefficient
-    (must be registered differentiable=True, acados provides parametric sensitivities only for
-    p_global) and the per-stage wave state. State z = (x, v), control u / U_SCALE, costs in J_SCALE.
-    """
-    lq = design_lq(d)
-    z, u = ca.SX.sym("z", 2), ca.SX.sym("u", 1)
-    wt = ca.vertcat(g[0] * wave[0] + g[1] * wave[1], -g[1] * wave[0] + g[0] * wave[1])  # G(g) w
-    y = ca.vertcat(z, wt, u)
-    S = np.diag([1.0, 1.0, 1.0, 1.0, U_SCALE])
-
-    ocp = AcadosOcp()
-    ocp.model.name = name
-    ocp.model.x, ocp.model.u = z, u
-    ocp.model.disc_dyn_expr = ca.DM(d.A) @ z + ca.DM(d.Gw) @ wt + ca.DM(d.Bu * U_SCALE) @ u
-    ocp.cost.cost_type = ocp.cost.cost_type_e = "EXTERNAL"
-    ocp.model.cost_expr_ext_cost = y.T @ ca.DM(S @ d.Wd @ S / J_SCALE) @ y
-    ocp.model.cost_expr_ext_cost_e = (
-        z.T @ ca.DM(lq.P / J_SCALE) @ z + 2 * z.T @ ca.DM(lq.Y / J_SCALE) @ wt
-    )
-
-    con, cost = ocp.constraints, ocp.cost
-    con.x0 = np.zeros(2)  # overwritten at every solve
-    ub = u_max / U_SCALE if np.isfinite(u_max) else 1e4  # leap-c needs bounds on u
-    con.idxbu, con.lbu, con.ubu = np.array([0]), np.array([-ub]), np.array([ub])
-    if np.isfinite(x_max):  # soft stroke limit, acados slack cost z s + 0.5 Z s^2
-        con.idxbx = con.idxbx_e = np.array([0])
-        con.lbx = con.lbx_e = np.array([-x_max])
-        con.ubx = con.ubx_e = np.array([x_max])
-        con.idxsbx = con.idxsbx_e = np.array([0])
-        cost.zl = cost.zu = cost.zl_e = cost.zu_e = np.array([slack_l1 / J_SCALE])
-        cost.Zl = cost.Zu = cost.Zl_e = cost.Zu_e = np.array([2 * slack_l2 / J_SCALE])
-
-    o = ocp.solver_options
-    o.N_horizon, o.tf = N, N * d.dt
-    o.cost_scaling = np.ones(N + 1)   # acados would otherwise multiply stage costs by dt
-    o.integrator_type = "DISCRETE"
-    o.nlp_solver_type = "SQP"         # the problem is a QP: one QP solve per call
-    o.hessian_approx = "EXACT"
-    o.regularize_method = "NO_REGULARIZE"   # the stage Hessians are indefinite on purpose
-    o.qp_solver = "PARTIAL_CONDENSING_HPIPM"
-    o.qp_solver_cond_N = N
-    o.qp_solver_ric_alg = 0           # classical Riccati: needs only R + B'PB > 0
-    o.with_solution_sens_wrt_params = True
-    o.with_value_sens_wrt_params = True
-    o.tol, o.qp_tol = 1e-8, 1e-9
-    o.nlp_solver_max_iter, o.qp_solver_iter_max = 20, 200
-    return ocp
-
-
-def phiw_powers(d: DiscreteModel, N: int) -> np.ndarray:
-    """Phiw^k for k = 0..N, shape (N+1, 2, 2)."""
-    return np.stack([np.linalg.matrix_power(d.Phiw, k) for k in range(N + 1)])
-
-
-def wave_forecast(phi_pow: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """Per-stage wave states w_k = Phiw^k w for a batch w of shape (B, 2): returns (B, N+1, 2)."""
-    return np.einsum("kij,bj->bki", phi_pow, np.asarray(w, dtype=float))
-
-
-def power_landscape(mpc, phi_pow: np.ndarray, env: RegularWaveWEC, gains, phases,
-                    periods: int = 12) -> dict:
+def power_landscape(planner: WecPlanner, env: WecEnv, gains, phases, periods: int = 12) -> dict:
     """Closed-loop mean power of the MPC on the plant env for every (gain, phase) of its
     excitation coefficient. All grid points run as one batch of plants (about 80 000 solves)."""
-    d, N = env.d, len(phi_pow) - 1
     G = np.array([g_polar(gn, ph) for gn in gains for ph in phases])          # (B, 2)
     Bsz, n_steps = len(G), periods * env.n_per
     g_t = torch.from_numpy(G)                                                   # differentiable parameter: (B, 2) tensor
-    z, w = np.zeros((Bsz, 2)), np.tile(env.reset()[1], (Bsz, 1))
+    obs = env.dynamics.reset(torch.zeros(Bsz, dtype=torch.float64))            # every plant from rest at a crest
     Pe = np.zeros((Bsz, n_steps))
-    for i in range(n_steps):
-        with torch.no_grad():
-            _, u0, *_ = mpc(torch.from_numpy(z), params={"g": g_t, "wave": wave_forecast(phi_pow, w)})
-        u = u0[:, 0].numpy() * U_SCALE
-        y = np.concatenate([z, w, u[:, None]], axis=1)
-        Pe[:, i] = -np.einsum("bi,ij,bj->b", y, d.Wd, y) / d.dt
-        z = z @ d.A.T + w @ d.Gw.T + u[:, None] * d.Bu[:, 0]
-        w = w @ d.Phiw.T
+    with torch.no_grad():
+        for i in range(n_steps):
+            u = planner(obs, params={"g": g_t})[1]
+            obs, energy = env.dynamics.step(obs, u)
+            Pe[:, i] = energy.numpy() / env.d.dt
     P = Pe[:, -5 * env.n_per:].mean(axis=1).reshape(len(gains), len(phases))
     return dict(gain=np.asarray(gains), phase=np.asarray(phases), P=P)
 
@@ -422,10 +100,46 @@ class ShacConfig:
     seed: int = 0
 
 
-def summarize(policy, env: RegularWaveWEC) -> dict:
+def rollout(policy, plant: WecDynamics, obs0: torch.Tensor, steps: int = 20):
+    """Energy of a closed-loop rollout from obs0 (B, 4), summed over plants and steps, in units of REWARD_SCALE."""
+    obs, R = obs0, 0.0
+    for _ in range(steps):
+        _, u = policy(obs)
+        obs, e = plant.step(obs, u)
+        R = R + e.sum() / REWARD_SCALE
+    return R
+
+
+def test_rollout_gradient(policy, plant: WecDynamics) -> None:
+    """Autograd dR/dg of a 20-step rollout on 4 plants (half near the stroke limit) vs central
+    finite differences. Resets policy.g to the nominal (1, 0)."""
+    rng = np.random.default_rng(3)
+    z0, w0 = rng.normal(size=(4, 2)) * 0.8, rng.normal(size=(4, 2)) * 0.4
+    z0[:2, 0] = rng.choice([-1, 1], size=2) * rng.uniform(1.3, 1.5, size=2)
+    obs0 = torch.from_numpy(np.concatenate([z0, w0], axis=1))
+    g0 = torch.tensor([0.9, 0.2], dtype=torch.float64)
+    with torch.no_grad():
+        policy.g.copy_(g0)
+    grad = torch.autograd.grad(rollout(policy, plant, obs0), policy.g)[0]   # one backward pass through 20 solves and 20 plant steps
+    fd = np.zeros(2)
+    for i in range(2):
+        vals = []
+        for s in (1, -1):
+            with torch.no_grad():
+                policy.g.copy_(g0)
+                policy.g[i] += s * 1e-5
+            vals.append(rollout(policy, plant, obs0).item())
+        fd[i] = (vals[0] - vals[1]) / 2e-5
+    with torch.no_grad():
+        policy.g.copy_(torch.tensor([1.0, 0.0]))   # back to the nominal model
+    print(f"dR/dg autograd {grad.numpy()}, finite differences {fd}, "
+          f"relative error {np.abs(grad.numpy() - fd).max() / np.abs(fd).max():.1e} (expected < 1e-3)")
+
+
+def summarize(policy, env: WecEnv) -> dict:
     """Training callback: steady-state power and the policy's excitation coefficient."""
     gain, phase = polar(policy.g.detach().numpy())
-    ev = evaluate(policy.act, env)
+    ev = evaluate(policy, env)
     return dict(power=ev["power"], xmax=ev["xmax"], gain=gain, phase=phase)
 
 
