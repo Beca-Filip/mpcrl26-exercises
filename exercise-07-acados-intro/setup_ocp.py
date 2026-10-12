@@ -57,13 +57,20 @@ def export_pendulum_model() -> AcadosModel:
     return model
 
 
-def setup_ocp(Fmax: float, N_horizon: int, Tf: float) -> AcadosOcp:
+def setup_ocp(Fmax: float, N_horizon: int, Tf: float,
+              w_x: float = 1., w_theta: float = 1., w_v: float = 1e-4, w_dtheta: float = 1e-4,
+              w_u: float = 1e-4) -> AcadosOcp:
     """Create an ocp object to formulate the OCP for the cartpole system.
     
     Args:
         Fmax: Maximum force that can be applied to the cart.
         N_horizon: Number of steps in the prediction horizon.
         Tf: Total time horizon of the prediction horizon.
+        w_x: Weight for the x state.
+        w_theta: Weight for the theta state.
+        w_v: Weight for the v state.
+        w_dtheta: Weight for the dtheta state.
+        w_u: Weight for the u input.
     """
     # TODO Exercise: Fill in the blanks in this method
     # create ocp object to formulate the OCP
@@ -81,42 +88,64 @@ def setup_ocp(Fmax: float, N_horizon: int, Tf: float) -> AcadosOcp:
     ocp.cost.cost_type_e = 'NONLINEAR_LS'
 
     # weight matrices
-    ocp.cost.W = np.zeros((nx+nu)) # TODO: set something # state and input weights
+    Wx = np.diag([4., 1., 1e-3, 1e-3])
+    Wu = np.diag([1e-4])
+    W = np.block([
+        [Wx, np.zeros((nx, nu))],   
+        [np.zeros((nu, nx)), Wu]
+    ])
+    # Wx = np.diag([w_x, w_theta, w_v, w_dtheta])
+    # Wu = np.diag([w_u])
+    # W = np.block([
+    #     [Wx, np.zeros((nx, nu))],   
+    #     [np.zeros((nu, nx)), Wu]
+    # ])
+    ocp.cost.W = W # TODO: set something # state and input weights
     ocp.cost.W_e = ocp.cost.W[:nx, :nx]
 
     # expressions for ys
     x = ocp.model.x
     u = ocp.model.u
     # NOTE (use x and u from the two lines above here)
+    # ocp.model.cost_y_expr = 0.5 * ca.vertcat(x, u).T @ ocp.cost.W @ ca.vertcat(x, u) 
+    # ocp.model.cost_y_expr_e = 0.5 * ca.vertcat(x).T @ ocp.cost.W_e @ ca.vertcat(x)
     ocp.model.cost_y_expr = ca.vertcat(x, u)
-    ocp.model.cost_y_expr_e = x
+    ocp.model.cost_y_expr_e = ca.vertcat(x)
 
     # references
-    raise NotImplementedError()
-    ocp.cost.yref = # desired state and input
+    # raise NotImplementedError()
+    y_ref = np.array([[0.0], [0.0], [0.0], [0.0], [0.0]])
+    ocp.cost.yref = y_ref # desired state and input
     ocp.cost.yref_e = ocp.cost.yref[:nx]
 
     # ============== set constraints ================
     # Actuator constraints
     # NOTE: Use Fmax
-    ocp.constraints.lbu =
-    ocp.constraints.ubu =
-    ocp.constraints.idxbu =
+    ocp.constraints.lbu = np.array([-Fmax])
+    ocp.constraints.ubu = np.array([Fmax])
+    ocp.constraints.idxbu = np.array([0])
 
     # Will be changed in the closed loop
     ocp.constraints.x0 = np.array([0.0, np.pi, 0.0, 0.0])
 
     # ============== set ocp options ================
     # prediction horizon
-    ocp.solver_options.N_horizon =
-    ocp.solver_options.tf =
+    ocp.solver_options.N_horizon = N_horizon
+    ocp.solver_options.tf = Tf
 
     # additional ocp options
+    # ocp.solver_options.nlp_solver_type = 'SQP'
+    # ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
     ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+    # ocp.solver_options.hessian_approx = 'EXACT'
     ocp.solver_options.integrator_type = 'ERK'
+    # ocp.solver_options.integrator_type = 'IRK'
     ocp.solver_options.qp_tol = 1e-8
-    ocp.solver_options.tol = 1e-6
-    ocp.solver_options.globalization = 'MERIT_BACKTRACKING'
+    # ocp.solver_options.qp_tol = 1e-5
+    # ocp.solver_options.tol = 1e-6
+    ocp.solver_options.tol = 1e-4
+    # ocp.solver_options.globalization = 'MERIT_BACKTRACKING'
+    ocp.solver_options.globalization = 'FIXED_STEP'
     ocp.name = 'pendulum_ocp'
 
     return ocp

@@ -17,7 +17,8 @@ def main():
     # create simulator
     sim = AcadosSim.from_ocp(ocp)
     sim.solver_options.T = dt
-    sim.parameter_values = np.array([1.])
+    sim.parameter_values = np.array([1.]) # 1.3 Same plant and model
+    # sim.parameter_values = np.array([1.1]) # 1.3 Plant and model mismatch by 10%
     integrator = AcadosSimSolver(sim)
 
     # initialize simulation
