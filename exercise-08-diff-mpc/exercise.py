@@ -17,6 +17,7 @@ def _():
     from utils import plot_sol_and_sens
 
     return (
+        AcadosDiffMpcTorch,
         AcadosOcp,
         AcadosParameterManager,
         ca,
@@ -98,7 +99,7 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
         nx = ocp.model.x.rows()
 
         # TODO Exercise 1: Create the parameter manager.
-        manager = ...
+        manager = AcadosParameterManager(N_horizon=N_horizon)
 
         # ======================= set cost =======================
         # NOTE: NONLINEAR_LS pseudo: 0.5 * (y_expr - yref)^T W (y_expr - yref)
@@ -121,8 +122,25 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
         # and then build xref accordingly. 
         # Register one parameter per reference field and make
         # only xref1 (the angle reference) differentiable with `differentiable=True`.
-        uref = ...
-        xref = ...
+        default_uref = np.array([0.0])
+        default_xref = np.array([[0.0], [0.0], [0.0], [0.0]])    
+        uref = manager.register_parameter(
+            name="uref", default=default_uref, differentiable=False
+        )
+        xref = ca.vertcat(
+            manager.register_parameter(
+                name="x1ref", default=default_xref[0], differentiable=False
+            ),
+            manager.register_parameter(
+                name="thetaref", default=default_xref[1], differentiable=True
+            ),
+            manager.register_parameter(
+                name="v1ref", default=default_xref[2], differentiable=False
+            ),
+            manager.register_parameter(
+                name="dthetaref", default=default_xref[3], differentiable=False
+            ),
+        )
         yref = ca.vertcat(xref, uref)
         yref_e = yref[: nx]
         ocp.cost.yref = yref
@@ -147,10 +165,12 @@ def _(AcadosOcp, AcadosParameterManager, ca, export_pendulum_model, np):
         ocp.solver_options.qp_tol = 1e-4
         ocp.solver_options.tol = 1e-3
         ocp.solver_options.nlp_solver_max_iter = 1000
+        # ocp.solver_options.tau_min = 1e-4 # I think this is the default value, but you can change it to 1e-1 for Exercise 4 or comment
+        # ocp.solver_options.tau_min = 1e-1 # Exercise 4 - change the tau_min - the barrier parameter for the interior point method during IFT differentiation. This is a hyperparameter that can be tuned to improve the quality of the gradients.
 
         return ocp, manager
 
-    return
+    return (setup_ocp_with_manager,)
 
 
 @app.cell(hide_code=True)
@@ -169,7 +189,7 @@ def _(mo):
 
 
 @app.cell
-def _(mo, np, plot_sol_and_sens, torch):
+def _(AcadosDiffMpcTorch, setup_ocp_with_manager, torch):
     N_horizon = 5
     T_horizon = 0.25
     Fmax = 80.0
@@ -181,18 +201,19 @@ def _(mo, np, plot_sol_and_sens, torch):
     p_values.requires_grad = True
 
     # TODO Exercise 2: Create the controller layer.
-    controller_layer = ...
+    ocp, manager = setup_ocp_with_manager(Fmax=Fmax, N_horizon=N_horizon, Tf=T_horizon)
+    controller_layer = AcadosDiffMpcTorch(ocp, manager)
 
     x0 = torch.tensor([0.0, torch.pi, 0.0, 0.0]).repeat(batch_size, 1)  # Shape (N, 4)
 
     # TODO Exercise 2: Solve the batch of OCPs.
-    params = ...
-    ctx, u0, x, u, value = ...
+    params = {"thetaref": p_values}
+    ctx, u0, x, u, value = controller_layer(x0, params=params)
 
     # Obtain the batched gradient du0/dp of shape (batch_size, 1)
     u0.sum().backward()
     du0_dp = p_values.grad
-    return batch_size, ctx, du0_dp, p_values, u0
+    return ctx, du0_dp, p_values, u0
 
 
 @app.cell(hide_code=True)
@@ -205,9 +226,10 @@ def _(mo):
 
 
 @app.cell
-def _(batch_size, ctx, du0_dp, np, p_values, u0):
+def _(ctx, du0_dp, p_values, u0):
     # TODO Exercise 5: Keep only the samples that converged (status 0).
-    mask = np.ones(batch_size, dtype=bool)
+    # mask = np.ones(batch_size, dtype=bool)
+    mask = (ctx.status == 0)
     # Convert to NumPy for plotting.
     p_converged = p_values.detach().numpy()[mask]
     u0_converged = u0.detach().numpy().flatten()[mask]
@@ -227,7 +249,15 @@ def _(mo):
 
 
 @app.cell
-def _(du0_dp_converged, mo, np, p_converged, p_failed, plot_sol_and_sens, u0_converged):
+def _(
+    du0_dp_converged,
+    mo,
+    np,
+    p_converged,
+    p_failed,
+    plot_sol_and_sens,
+    u0_converged,
+):
     du0_dp_fd = np.gradient(u0_converged, p_converged.flatten())
 
     test_tol = 1e-3
