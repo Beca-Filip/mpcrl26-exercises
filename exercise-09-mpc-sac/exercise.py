@@ -110,8 +110,17 @@ def _(
 
         # The angle reference theta_ref (xref1) as a parameter.
         manager = AcadosParameterManager(N_horizon=N_horizon)
-        xref1 = ...  # TODO: register the angle reference (one value, default 0) as a differentiable parameter.
-        x_err = ...  # TODO: state error x - (0, xref1, 0, 0).
+        xref1 = ca.vertcat(
+            [0.0],
+            manager.register_parameter("theta_ref", default=np.array([[0.0]]), differentiable=True),
+            [0.0],
+            [0.0],
+        )  # TODO: register the angle reference (one value, default 0) as a differentiable parameter.
+        x_err = ocp.model.x - xref1  # TODO: state error x - (0, xref1, 0, 0).
+
+        print(f"ocp.model.x.shape", ocp.model.x.shape)
+        print(f"xref1.shape", xref1.shape)
+        print(f"x_err.shape", x_err.shape)
 
         # Cost of Exercise 07 around the reference: 1/2 y^T W y with y = (x - x_ref, F).
         ocp.cost.cost_type = ocp.cost.cost_type_e = "NONLINEAR_LS"
@@ -182,7 +191,7 @@ def _(mo):
 
 
 @app.cell
-def _(CartPoleEnv, gym, mpc, np, torch):
+def _(CartPoleEnv, THETA_MAX, gym, mpc, np, torch):
     class MpcEnv(gym.Wrapper):
         def __init__(self, env, mpc):
             super().__init__(env)
@@ -195,12 +204,14 @@ def _(CartPoleEnv, gym, mpc, np, torch):
             return self.env.reset(**kwargs)
 
         def step(self, action):
-            theta_ref = ...  # TODO: THETA_MAX a^3 as a float32 tensor of shape (1, 1).
+            theta_ref = torch.tensor([THETA_MAX * action**3], dtype=torch.float32)  # TODO: THETA_MAX a^3 as a float32 tensor of shape (1, 1).
             self.theta_ref = theta_ref.numpy()[0]  # kept for plotting
             state = torch.as_tensor(self.unwrapped.s, dtype=torch.float32)[None]  # the full state
+            # print(f"theta_ref.shape", theta_ref.shape, f"theta_ref", theta_ref)
+            # print(f"state.shape", state.shape, f"state", state)
             with torch.no_grad():
                 # TODO: solve the MPC for state with params {"xref1": theta_ref}, warm-started with self.ctx.
-                self.ctx, force, plan_x, _, _ = ...
+                self.ctx, force, plan_x, _, _ = self.mpc(state, params={"theta_ref": theta_ref}, ctx=self.ctx)
             self.force, self.plan = force.numpy()[0], plan_x.numpy()[0]
             return self.env.step(self.force)
 
