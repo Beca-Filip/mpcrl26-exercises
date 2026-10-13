@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Arc, ConnectionPatch
 
 from wec import WecDynamics, polar
 
@@ -127,6 +128,59 @@ _KEYS = (("SHAC", C_SHAC), ("nominal", C_NOM), ("passive", C_PAS), ("damper", C_
 
 def _color(label: str) -> str:
     return next((c for key, c in _KEYS if key in label), C_MPC)
+
+
+def plot_excitation(g_true, wt1: float = 60.0):
+    """Excitation force of the nominal model g = (1, 0) and of the plant g_true, normalised by Gamma A:
+    over one wave period (left) and as phasors at the instant wt1 [deg] (right). The phasors turn
+    counter-clockwise from wt = 0, the wave crest, at the top; a phasor's height is the force."""
+    gain, phase = polar(g_true)
+    fig, (ax_t, ax_p) = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True,
+                                     gridspec_kw=dict(width_ratios=[1.8, 1.2]))
+    wt = np.linspace(0, 360, 361)
+    th = np.linspace(0, 2 * np.pi, 200)
+    curves = (("nominal model g = (1, 0)", 1.0, 0.0, C_NOM),
+              (f"plant g* = {gain:.1f} (cos {phase:.0f}°, sin {phase:.0f}°)", gain, phase, C_MPC))
+    ax_t.axvline(wt1, color="0.6", lw=0.8)
+    ax_t.text(wt1, -1.22, r" $\omega t_1$", color="0.4", ha="left", va="bottom")
+    for label, a, lag, color in curves:
+        ax_t.plot(wt, a * np.cos(np.radians(wt - lag)), color=color, lw=2, label=label)
+        for y in (a, -a):   # amplitude lines across both panels
+            ax_t.axhline(y, color=color, lw=0.6, ls="--")
+            ax_p.axhline(y, color=color, lw=0.6, ls="--")
+        ax_p.plot(a * np.cos(th), a * np.sin(th), color=color, lw=0.8, ls="--")
+        ang = np.radians(wt1 - lag)
+        tip = (-a * np.sin(ang), a * np.cos(ang))   # counter-clockwise from the top
+        ax_p.annotate("", xy=tip, xytext=(0, 0), arrowprops=dict(arrowstyle="-|>", lw=2, color=color))
+        ax_t.plot(wt1, tip[1], "o", color=color)
+        fig.add_artist(ConnectionPatch((wt1, tip[1]), tip, "data", "data", axesA=ax_t, axesB=ax_p,
+                                       color=color, lw=1, ls=":"))
+    # The lag in time: the downward zero crossings at 90 deg and 90 deg + phase.
+    ax_t.annotate("", xy=(90 + phase, 0), xytext=(90, 0), arrowprops=dict(arrowstyle="<->", color="0.2"))
+    ax_t.text(90 + phase / 2, 0.06, f"{phase:.0f}°", ha="center", va="bottom")
+    ax_t.set(xlabel=r"wave phase $\omega t$ [deg] (0: crest)", ylabel=r"$F_{ex} / (\Gamma A)$",
+             xticks=[0, 90, 180, 270, 360], xlim=(0, 360), ylim=(-1.25, 1.25),
+             title="Excitation force over one wave period")
+    ax_t.legend(fontsize=8, loc="lower right")
+    # The lag as an angle: an arc between the two phasors, and the direction of rotation.
+    ax_p.add_patch(Arc((0, 0), 0.7, 0.7, theta1=90 + wt1 - phase, theta2=90 + wt1, color="0.2"))
+    mid = np.radians(90 + wt1 - phase / 2)
+    ax_p.text(0.45 * np.cos(mid), 0.45 * np.sin(mid), f"{phase:.0f}°", ha="center", va="center")
+    ax_p.annotate("", xy=(1.12 * np.cos(np.radians(-10)), 1.12 * np.sin(np.radians(-10))),
+                  xytext=(1.12 * np.cos(np.radians(-50)), 1.12 * np.sin(np.radians(-50))),
+                  arrowprops=dict(arrowstyle="-|>", color="0.2", connectionstyle="arc3,rad=0.2"))
+    ax_p.text(1.05, -0.55, r"$\omega$", ha="left", va="center")
+    for text, xy, ha, va in (("0° (crest)", (0, 1.04), "center", "bottom"), ("90°", (-1.04, 0), "right", "center"),
+                             ("180°", (0, -1.04), "center", "top"), ("270°", (1.04, 0), "left", "center")):
+        ax_p.text(*xy, text, ha=ha, va=va, fontsize=8, color="0.3")
+    ax_p.plot([-1.05, 1.05], [0, 0], color="0.6", lw=0.6)
+    ax_p.plot([0, 0], [-1.05, 1.05], color="0.6", lw=0.6)
+    ax_p.set(xlim=(-1.45, 1.45), title=r"Phasors, turning at $\omega$")
+    ax_p.set_aspect("equal", adjustable="box")
+    ax_p.axis("off")
+    ax_t.grid(alpha=0.3)
+    fig.tight_layout()
+    return fig
 
 
 def plot_closed_loop(logs: dict[str, dict], x_max: float, u_max: float, n_per: int):

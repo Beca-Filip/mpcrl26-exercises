@@ -18,6 +18,7 @@ def _():
         ShacConfig,
         evaluate,
         plot_closed_loop,
+        plot_excitation,
         plot_training,
         result_table,
         summarize,
@@ -54,6 +55,7 @@ def _():
         np,
         optimal_damper,
         plot_closed_loop,
+        plot_excitation,
         plot_training,
         polar,
         result_table,
@@ -106,8 +108,22 @@ def _(mo):
     The **excitation coefficient** $g = (g_1, g_2)$ scales the force by $|g|$ and delays it by
     the angle of $g$. The long-wave model, and with it the MPC below, has $g = (1, 0)$. The plant
     in this exercise has $g^\star = 0.8\,(\cos 40^\circ, \sin 40^\circ)$: its excitation force
-    is 20 % weaker and lags the wave by 40 degrees.
+    is 20 % weaker and lags the wave by 40 degrees. The figure shows both forces over one wave
+    period and as phasors, arrows that turn counter-clockwise at $\omega$ and whose height is
+    the force.
+    """)
+    return
 
+
+@app.cell
+def _(G_TRUE, plot_excitation):
+    plot_excitation(G_TRUE)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
     **Where the mismatch comes from.** The excitation force cannot be measured. It is
     reconstructed from a wave estimate (a sensor on the buoy, a wave rider some distance
     up-wave, a forecast), its amplitude and phase relative to the wave elevation depend on the
