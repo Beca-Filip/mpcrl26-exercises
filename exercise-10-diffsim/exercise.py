@@ -502,6 +502,14 @@ def _(td_lambda_targets, torch):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **TODO**: In the following, the SHAC training is implemented. Read the training loop carefully and try to build an understanding how the algorithm backpropagates from the loss to the learnable excitation parameters. You do not need to complete the code to make it run. Try playing around with different parameters and observe what happens.
+    """)
+    return
+
+
 @app.cell
 def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
     def train(policy, plant, cfg, callback=None):
