@@ -130,6 +130,7 @@ def _(mo):
     under `torch.no_grad()`, and the training loop of Section 4 steps a batch of plants with
     autograd recording the whole rollout.
     """)
+    return
 
 
 @app.cell
@@ -184,6 +185,7 @@ def _(mo):
     such policy on one plant for 20 wave periods from rest and averages the power over the last
     five.
     """)
+    return
 
 
 @app.cell
@@ -246,10 +248,20 @@ def _(mo):
     `ControllerFromPlanner` turns the planner into a `ParameterizedController` that returns only
     `(ctx, u0)`: the MPC as a controller.
     """)
+    return
 
 
 @app.cell
-def _(ControllerFromPlanner, DT, N, U_MAX, WecPlanner, WecPlannerConfig, X_MAX, p):
+def _(
+    ControllerFromPlanner,
+    DT,
+    N,
+    U_MAX,
+    WecPlanner,
+    WecPlannerConfig,
+    X_MAX,
+    p,
+):
     planner = WecPlanner(
         WecPlannerConfig(
             N_horizon=N, dt=DT, x_max=X_MAX, u_max=U_MAX, params=p, n_batch_init=16
@@ -285,6 +297,7 @@ def _(mo):
 
     Complete `forward`.
     """)
+    return
 
 
 @app.cell
@@ -316,6 +329,7 @@ def _(mo):
     same MPC with $g^\star$ in its model: the best this MPC can do on this plant. Every
     controller runs on the same plant for 20 periods from rest.
     """)
+    return
 
 
 @app.cell
@@ -345,18 +359,20 @@ def _(mo):
     its parameter $g$ **and** in its initial state $z_0$, because the gradient flows through the
     state from one step to the next. leap-c provides $\partial u_0/\partial g$ and
     $\partial u_0/\partial z_0$ from the implicit function theorem on the KKT conditions of the
-    converged QP, reusing HPIPM's factorisation (Frey et al. 2025).
+    converged QP, reusing HPIPM's factorisation (Frey et al. 2026).
 
     **Is it really differentiable?** Roll the policy out for 20 steps on 4 plants, sum the
     energy, and compare the gradient with respect to $g$ from autograd with central finite
     differences. Half of the initial states sit near the stroke limit so that constraints are
     active along the way.
     """)
+    return
 
 
 @app.cell
 def _(MpcPolicy, mpc, plant, test_rollout_gradient):
     test_rollout_gradient(MpcPolicy(mpc), plant)
+    return
 
 
 @app.cell(hide_code=True)
@@ -378,26 +394,33 @@ def _(mo):
 
     **Loss.** Simulator and policy are differentiable, so the gradient of a window of $h$ steps
     is one `backward()` through $h$ plant steps and $h$ MPC solves: no action noise, no
-    likelihood ratio. SHAC (Xu et al. 2022) closes the window with a learned value $V_\phi$:
+    likelihood ratio. SHAC (Xu et al. 2022) closes the window with the value of the state it
+    leaves behind:
 
     $$
     L(g) = -\frac{1}{h}\,\frac{1}{n}\sum_{i=1}^{n}\Big[\sum_{t=0}^{h-1}\gamma^t r_t^{(i)}
-      + \gamma^h\, V_\phi\big(s_h^{(i)}\big)\Big].
+      + \gamma^h\Big(\Phi\big(s_h^{(i)}\big) + V_\phi\big(s_h^{(i)}\big)\Big)\Big],
+    \qquad \Phi(s) = \frac{\tfrac12 k x^2 + \tfrac12 M v^2}{10^5\,\mathrm{J}} .
     $$
 
     The plants keep running across iterations, but the graph is cut every $h$ steps with
     `detach`. Without the value term the window would ignore the energy stored in the moving
     buoy (about 200 kJ, against a net yield of about 50 kJ per step) and reward *not* storing
-    it. The critic is a small MLP on the scaled state $s = (z, w)$, fitted by regression to
-    TD($\lambda$) returns of the same rollouts,
+    it, that is, a smaller excitation gain. That stored energy $\Phi$ is known, so only the
+    rest of the value is learned, by a critic $V_\phi$: a small MLP on the scaled state
+    $s = (z, w)$. This matters because the actor sees the value only through its slope at
+    $s_h$, which a critic fitted to values gets only roughly. The critic is fitted by regression to
+    TD($\lambda$) returns of the same rollouts with the shaped rewards
+    $r_t' = r_t + \gamma\,\Phi(s_{t+1}) - \Phi(s_t)$,
 
     $$
-    G_t = r_t + \gamma\big[(1 - \lambda)\, V_{\bar\phi}(s_{t+1}) + \lambda\, G_{t+1}\big],
+    G_t = r_t' + \gamma\big[(1 - \lambda)\, V_{\bar\phi}(s_{t+1}) + \lambda\, G_{t+1}\big],
     \qquad G_h = V_{\bar\phi}(s_h),
     $$
 
-    with a slowly moving target network $\bar\phi$. An untrained critic would give the
-    truncated gradient, so the first `critic_warmup` iterations fit the critic only.
+    with a slowly moving target network $\bar\phi$. The $\Phi$ terms telescope, so
+    $\Phi(s_t) + G_t$ is the TD($\lambda$) return of the full value. An untrained critic would
+    bias the gradient, so the first `critic_warmup` iterations fit the critic only.
 
     **Batching and exploration.** The $n$ plants are one batch of the acados solver: one call
     `policy(obs)` solves $n$ OCPs in parallel. There is no action noise; diversity comes from
@@ -406,17 +429,24 @@ def _(mo):
     `ShacConfig` in `utils.py` collects the settings. Complete `reward`, `td_lambda_targets` and
     the two marked lines of `train`, then read the loop: it is the whole pipeline.
     """)
+    return
 
 
 @app.cell
-def _(REWARD_SCALE, torch):
+def _(REWARD_SCALE, p, torch):
     def reward(energy, x_next, cfg):
         """Electrical energy of the step minus the stroke-violation penalty, in units of REWARD_SCALE. All (B,)."""
         return (
             energy - cfg.viol_weight * torch.relu(x_next.abs() - cfg.x_max) ** 2
         ) / REWARD_SCALE
 
-    return (reward,)
+    def stored_energy(obs):
+        """Phi: the energy stored in the moving buoy, 1/2 k x^2 + 1/2 M v^2, in units of REWARD_SCALE. obs: (..., 4)."""
+        return (
+            0.5 * p.k * obs[..., 0] ** 2 + 0.5 * p.M * obs[..., 1] ** 2
+        ) / REWARD_SCALE
+
+    return reward, stored_energy
 
 
 @app.cell
@@ -427,6 +457,7 @@ def _(ShacConfig, reward, torch):
             torch.tensor([1e5, 1e5]), torch.tensor([1.0, 1.6]), ShacConfig(x_max=1.5)
         ),
     )
+    return
 
 
 @app.cell
@@ -454,10 +485,11 @@ def _(td_lambda_targets, torch):
             lam=0.5,
         ),
     )
+    return
 
 
 @app.cell
-def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
+def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
     def train(policy, plant, cfg, callback=None):
         """SHAC. Trains policy.parameters() in place; returns a log per iteration."""
         torch.manual_seed(cfg.seed)
@@ -503,8 +535,10 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
                 rews.append(reward(energy, obs[:, 0], cfg))
                 ret = ret + cfg.gamma**t * rews[-1]
             obs_log.append(obs / scale)
-            # Bootstrap with the target critic.
-            ret = ret + cfg.gamma**cfg.horizon * target(obs_log[-1]).squeeze(-1)
+            # Bootstrap with the value of the last obs: stored energy plus target critic.
+            ret = ret + cfg.gamma**cfg.horizon * (
+                stored_energy(obs) + target(obs_log[-1]).squeeze(-1)
+            )
             loss = -ret.mean() / cfg.horizon
             steps += cfg.horizon
             if it >= 0:  # warm-up iterations train the critic only
@@ -516,8 +550,12 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 
             with torch.no_grad():  # regression targets from the same rollout
                 O, R = torch.stack(obs_log), torch.stack(rews)
+                Phi = stored_energy(O * scale)  # the critic learns the value minus Phi
                 targets = td_lambda_targets(
-                    R, target(O[1:]).squeeze(-1), cfg.gamma, cfg.lam
+                    R + cfg.gamma * Phi[1:] - Phi[:-1],  # shaped rewards r'
+                    target(O[1:]).squeeze(-1),
+                    cfg.gamma,
+                    cfg.lam,
                 )
                 X, Yt = O[:-1].reshape(-1, 4), targets.reshape(-1)
             for _ in range(cfg.critic_epochs):
@@ -532,15 +570,15 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 
             if it < 0:
                 continue
-            entry = dict(
-                it=it + 1,
-                env_steps=(cfg.critic_warmup + it + 1) * cfg.horizon * cfg.n_env,
-                loss=loss.item(),
-                grad_norm=grad_norm,
-                critic_loss=critic_loss,
-                solver_failures=failed,
-                mean_reward=torch.stack(rews).mean().item(),
-            )
+            entry = {
+                "it": it + 1,
+                "env_steps": (cfg.critic_warmup + it + 1) * cfg.horizon * cfg.n_env,
+                "loss": loss.item(),
+                "grad_norm": grad_norm,
+                "critic_loss": critic_loss,
+                "solver_failures": failed,
+                "mean_reward": torch.stack(rews).mean().item(),
+            }
             if callback is not None:
                 entry.update(callback(it + 1, policy))
             log.append(entry)
@@ -553,9 +591,10 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 def _(mo):
     mo.md(r"""
     Train from the nominal $g = (1, 0)$ with the defaults of `ShacConfig`: 16 plants, $h = 10$,
-    50 critic warm-up iterations and 300 actor updates. Every 10 iterations the MPC is evaluated
-    with the closed loop of Section 3. About 35 s on a laptop CPU.
+    50 critic warm-up iterations and 150 actor updates. Every 10 iterations the MPC is evaluated
+    with the closed loop of Section 3. About 20 s on a laptop CPU.
     """)
+    return
 
 
 @app.cell
@@ -593,6 +632,7 @@ def _(mo):
     Steady-state power of every controller on the plant, and how much of the gap between the
     nominal MPC and the oracle the training recovers.
     """)
+    return
 
 
 @app.cell
@@ -617,8 +657,9 @@ def _(G_TRUE, ev, mo, polar, result_table, shac_log):
     ]
     mo.md(
         result_table(_rows, _nom["power"], _orc["power"])
-        + "\n\n(expected: SHAC about 32.7 kW and 90 % of the gap)"
+        + "\n\n(expected: SHAC about 33.5 kW, nearly all of the gap)"
     )
+    return
 
 
 @app.cell
@@ -629,6 +670,7 @@ def _(G_TRUE, ev, plot_training, shac_log):
         ev["MPC, true model (oracle)"]["power"],
         G_TRUE,
     )
+    return
 
 
 @app.cell
@@ -643,6 +685,12 @@ def _(U_MAX, X_MAX, ev, evaluate, plant, plot_closed_loop, pol_shac):
         U_MAX,
         plant.n_per,
     )
+    return
+
+
+@app.cell
+def _():
+    return
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ class ShacConfig:
     x_max: float                 # stroke limit [m]: reward penalty and state scaling
     horizon: int = 10            # h: rollout length per iteration [steps]
     n_env: int = 16              # parallel plants = batch size of the MPC solver
-    iters: int = 300             # actor updates
+    iters: int = 150             # actor updates
     gamma: float = 0.99
     lam: float = 0.95            # TD(lambda)
     actor_lr: float = 0.01       # Adam, decays linearly to 10 %
@@ -130,25 +130,26 @@ def _color(label: str) -> str:
 
 
 def plot_closed_loop(logs: dict[str, dict], x_max: float, u_max: float, n_per: int):
-    """Heave over the whole run, PTO force and electrical power over the last two periods."""
+    """Heave, PTO force and electrical power over the last five periods (the window of the mean
+    power)."""
     fig, axs = plt.subplots(3, 1, figsize=(8, 9))
     first = next(iter(logs.values()))
-    sl = slice(-2 * n_per, None)
+    sl = slice(-5 * n_per, None)
     ts = first["t"][sl] - first["t"][sl][0]
     axs[0].axhspan(-x_max, x_max, color="0.9", lw=0, label=f"stroke limit +-{x_max:g} m")
     for label, lg in logs.items():
-        axs[0].plot(lg["t"], lg["x"], color=_color(label), lw=1.5, label=label)
-    axs[0].set(xlabel="time [s]", ylabel="x [m]", title="Heave")
+        axs[0].plot(ts, lg["x"][sl], color=_color(label), lw=1.5, label=label)
+    axs[0].set(xlabel="time in the last five periods [s]", ylabel="x [m]", title="Heave")
     for lim in (u_max, -u_max):
         axs[1].axhline(lim / 1e3, color="0.5", lw=0.8)
     for label, lg in logs.items():
         axs[1].step(ts, lg["u"][sl] / 1e3, where="post", color=_color(label), lw=1.5, label=label)
-    axs[1].set(xlabel="time in the last two periods [s]", ylabel="u [kN]", title="PTO force")
+    axs[1].set(xlabel="time in the last five periods [s]", ylabel="u [kN]", title="PTO force")
     axs[2].axhline(0, color="0.5", lw=0.8)
     for label, lg in logs.items():
         axs[2].step(ts, lg["Pe"][sl] / 1e3, where="post", color=_color(label), lw=1.5,
                     label=f"{label}: mean {steady_mean(lg['Pe'], n_per) / 1e3:.1f} kW")
-    axs[2].set(xlabel="time in the last two periods [s]", ylabel="P_e [kW]",
+    axs[2].set(xlabel="time in the last five periods [s]", ylabel="P_e [kW]",
                title="Electrical power (negative = motoring)")
     for ax in axs:
         ax.grid(alpha=0.3)

@@ -378,26 +378,34 @@ def _(mo):
 
     **Loss.** Simulator and policy are differentiable, so the gradient of a window of $h$ steps
     is one `backward()` through $h$ plant steps and $h$ MPC solves: no action noise, no
-    likelihood ratio. SHAC (Xu et al. 2022) closes the window with a learned value $V_\phi$:
+    likelihood ratio. SHAC (Xu et al. 2022) closes the window with the value of the state it
+    leaves behind:
 
     $$
     L(g) = -\frac{1}{h}\,\frac{1}{n}\sum_{i=1}^{n}\Big[\sum_{t=0}^{h-1}\gamma^t r_t^{(i)}
-      + \gamma^h\, V_\phi\big(s_h^{(i)}\big)\Big].
+      + \gamma^h\Big(\Phi\big(s_h^{(i)}\big) + V_\phi\big(s_h^{(i)}\big)\Big)\Big],
+    \qquad \Phi(s) = \frac{\tfrac12 k x^2 + \tfrac12 M v^2}{10^5\,\mathrm{J}} .
     $$
 
     The plants keep running across iterations, but the graph is cut every $h$ steps with
     `detach`. Without the value term the window would ignore the energy stored in the moving
     buoy (about 200 kJ, against a net yield of about 50 kJ per step) and reward *not* storing
-    it. The critic is a small MLP on the scaled state $s = (z, w)$, fitted by regression to
-    TD($\lambda$) returns of the same rollouts,
+    it, that is, a smaller excitation gain. That stored energy $\Phi$ is known, so only the
+    rest of the value is learned, by a critic $V_\phi$: a small MLP on the scaled state
+    $s = (z, w)$. This matters because the actor sees the value only through its slope at
+    $s_h$, which a critic fitted to values gets only roughly; an underestimated slope is the
+    truncation bias again and pulls the gain down. The critic is fitted by regression to
+    TD($\lambda$) returns of the same rollouts with the shaped rewards
+    $r_t' = r_t + \gamma\,\Phi(s_{t+1}) - \Phi(s_t)$,
 
     $$
-    G_t = r_t + \gamma\big[(1 - \lambda)\, V_{\bar\phi}(s_{t+1}) + \lambda\, G_{t+1}\big],
+    G_t = r_t' + \gamma\big[(1 - \lambda)\, V_{\bar\phi}(s_{t+1}) + \lambda\, G_{t+1}\big],
     \qquad G_h = V_{\bar\phi}(s_h),
     $$
 
-    with a slowly moving target network $\bar\phi$. An untrained critic would give the
-    truncated gradient, so the first `critic_warmup` iterations fit the critic only.
+    with a slowly moving target network $\bar\phi$. The $\Phi$ terms telescope, so
+    $\Phi(s_t) + G_t$ is the TD($\lambda$) return of the full value. An untrained critic would
+    bias the gradient, so the first `critic_warmup` iterations fit the critic only.
 
     **Batching and exploration.** The $n$ plants are one batch of the acados solver: one call
     `policy(obs)` solves $n$ OCPs in parallel. There is no action noise; diversity comes from
@@ -409,12 +417,18 @@ def _(mo):
 
 
 @app.cell
-def _(REWARD_SCALE, torch):
+def _(REWARD_SCALE, p, torch):
     def reward(energy, x_next, cfg):
         """Electrical energy of the step minus the stroke-violation penalty, in units of REWARD_SCALE. All (B,)."""
         return ...  # TODO: energy minus the quadratic penalty on |x_next| beyond cfg.x_max, in units of REWARD_SCALE.
 
-    return (reward,)
+    def stored_energy(obs):
+        """Phi: the energy stored in the moving buoy, 1/2 k x^2 + 1/2 M v^2, in units of REWARD_SCALE. obs: (..., 4)."""
+        return (
+            0.5 * p.k * obs[..., 0] ** 2 + 0.5 * p.M * obs[..., 1] ** 2
+        ) / REWARD_SCALE
+
+    return reward, stored_energy
 
 
 @app.cell
@@ -455,7 +469,7 @@ def _(td_lambda_targets, torch):
 
 
 @app.cell
-def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
+def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
     def train(policy, plant, cfg, callback=None):
         """SHAC. Trains policy.parameters() in place; returns a log per iteration."""
         torch.manual_seed(cfg.seed)
@@ -501,8 +515,8 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
                 rews.append(reward(energy, obs[:, 0], cfg))
                 ret = ret + cfg.gamma**t * rews[-1]
             obs_log.append(obs / scale)
-            # Bootstrap with the target critic.
-            ret = ret + ...  # TODO: add the target critic's value of the last obs.
+            # Bootstrap with the value of the last obs: stored energy plus target critic.
+            ret = ret + ...  # TODO: gamma^h * (Phi + target critic) of the last obs.
             loss = -ret.mean() / cfg.horizon
             steps += cfg.horizon
             if it >= 0:  # warm-up iterations train the critic only
@@ -514,8 +528,12 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 
             with torch.no_grad():  # regression targets from the same rollout
                 O, R = torch.stack(obs_log), torch.stack(rews)
+                Phi = stored_energy(O * scale)  # the critic learns the value minus Phi
                 targets = td_lambda_targets(
-                    R, target(O[1:]).squeeze(-1), cfg.gamma, cfg.lam
+                    R + cfg.gamma * Phi[1:] - Phi[:-1],  # shaped rewards r'
+                    target(O[1:]).squeeze(-1),
+                    cfg.gamma,
+                    cfg.lam,
                 )
                 X, Yt = O[:-1].reshape(-1, 4), targets.reshape(-1)
             for _ in range(cfg.critic_epochs):
@@ -551,8 +569,8 @@ def _(deepcopy, nn, np, reward, td_lambda_targets, torch):
 def _(mo):
     mo.md(r"""
     Train from the nominal $g = (1, 0)$ with the defaults of `ShacConfig`: 16 plants, $h = 10$,
-    50 critic warm-up iterations and 300 actor updates. Every 10 iterations the MPC is evaluated
-    with the closed loop of Section 3. About 35 s on a laptop CPU.
+    50 critic warm-up iterations and 150 actor updates. Every 10 iterations the MPC is evaluated
+    with the closed loop of Section 3. About 20 s on a laptop CPU.
     """)
 
 
@@ -615,7 +633,7 @@ def _(G_TRUE, ev, mo, polar, result_table, shac_log):
     ]
     mo.md(
         result_table(_rows, _nom["power"], _orc["power"])
-        + "\n\n(expected: SHAC about 32.7 kW and 90 % of the gap)"
+        + "\n\n(expected: SHAC about 33.5 kW, nearly all of the gap)"
     )
 
 
