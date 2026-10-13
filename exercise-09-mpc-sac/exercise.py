@@ -110,13 +110,9 @@ def _(
 
         # The angle reference theta_ref (xref1) as a parameter.
         manager = AcadosParameterManager(N_horizon=N_horizon)
-        xref1 = ca.vertcat(
-            [0.0],
-            manager.register_parameter("theta_ref", default=np.array([[0.0]]), differentiable=True),
-            [0.0],
-            [0.0],
-        )  # TODO: register the angle reference (one value, default 0) as a differentiable parameter.
-        x_err = ocp.model.x - xref1  # TODO: state error x - (0, xref1, 0, 0).
+        xref1 = manager.register_parameter("xref1", default=np.array([[0.0]]), differentiable=True)  # TODO: register the angle reference (one value, default 0) as a differentiable parameter.
+        xref = ca.vertcat(0.0, xref1, 0.0, 0.0)
+        x_err = x - xref  # TODO: state error x - (0, xref1, 0, 0).
 
         print(f"ocp.model.x.shape", ocp.model.x.shape)
         print(f"xref1.shape", xref1.shape)
@@ -211,7 +207,7 @@ def _(CartPoleEnv, THETA_MAX, gym, mpc, np, torch):
             # print(f"state.shape", state.shape, f"state", state)
             with torch.no_grad():
                 # TODO: solve the MPC for state with params {"xref1": theta_ref}, warm-started with self.ctx.
-                self.ctx, force, plan_x, _, _ = self.mpc(state, params={"theta_ref": theta_ref}, ctx=self.ctx)
+                self.ctx, force, plan_x, _, _ = self.mpc(state, params={"xref1": theta_ref}, ctx=self.ctx)
             self.force, self.plan = force.numpy()[0], plan_x.numpy()[0]
             return self.env.step(self.force)
 
