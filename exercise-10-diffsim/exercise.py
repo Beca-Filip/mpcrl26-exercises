@@ -1,3 +1,10 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "marimo>=0.25.1",
+# ]
+# ///
+
 import marimo
 
 __generated_with = "0.25.1"
@@ -69,7 +76,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # Exercise 10 — Learning an MPC through a differentiable simulator
+    # Exercise 10 — Learning an MPC through a differentiable simulator (Solution)
 
     **Goal:** a wave energy converter is controlled by an economic MPC whose model of the wave
     force is wrong in a single coefficient $g$. You will (1) see where this mismatch comes from,
@@ -112,11 +119,13 @@ def _(mo):
     period and as phasors, arrows that turn counter-clockwise at $\omega$ and whose height is
     the force.
     """)
+    return
 
 
 @app.cell
 def _(G_TRUE, plot_excitation):
     plot_excitation(G_TRUE)
+    return
 
 
 @app.cell(hide_code=True)
@@ -144,6 +153,7 @@ def _(mo):
     under `torch.no_grad()`, and the training loop of Section 4 steps a batch of plants with
     autograd recording the whole rollout.
     """)
+    return
 
 
 @app.cell
@@ -198,6 +208,7 @@ def _(mo):
     such policy on one plant for 20 wave periods from rest and averages the power over the last
     five.
     """)
+    return
 
 
 @app.cell
@@ -231,7 +242,7 @@ def _(mo):
     \end{aligned}
     $$
 
-    $P$ solves a discrete algebraic Riccati equation and $Y$ a Stein equation (`design_lq`).
+    $P$ solves a discrete algebraic Riccati equation and $Y$ a discrete Lyapunov equation (`design_lq`).
     The stroke limit is soft because a hard bound is not recursively feasible against a
     persistent wave. The OCP is given (`export_parametric_ocp` in `wec/acados_ocp.py`): acados
     with discrete dynamics, external cost and HPIPM, inputs scaled by $10^5$ N and costs by
@@ -260,10 +271,20 @@ def _(mo):
     `ControllerFromPlanner` turns the planner into a `ParameterizedController` that returns only
     `(ctx, u0)`: the MPC as a controller.
     """)
+    return
 
 
 @app.cell
-def _(ControllerFromPlanner, DT, N, U_MAX, WecPlanner, WecPlannerConfig, X_MAX, p):
+def _(
+    ControllerFromPlanner,
+    DT,
+    N,
+    U_MAX,
+    WecPlanner,
+    WecPlannerConfig,
+    X_MAX,
+    p,
+):
     planner = WecPlanner(
         WecPlannerConfig(
             N_horizon=N, dt=DT, x_max=X_MAX, u_max=U_MAX, params=p, n_batch_init=16
@@ -299,6 +320,7 @@ def _(mo):
 
     Complete `forward`.
     """)
+    return
 
 
 @app.cell
@@ -315,7 +337,7 @@ def _(nn, np, torch):
         def forward(self, obs, ctx=None):
             """obs: (B, 4). Returns the leap-c context (solver status, warm start) and the PTO force (B, 1) [N]."""
             # The parameter itself, expanded to the batch, graph intact.
-            params = ...  # TODO: {"g": self.g for every plant, (B, 2), graph intact}.
+            params = {"g": self.g.expand(obs.shape[0], 2)}
             return self.controller(obs, params=params, ctx=ctx)
 
     return (MpcPolicy,)
@@ -330,6 +352,7 @@ def _(mo):
     same MPC with $g^\star$ in its model: the best this MPC can do on this plant. Every
     controller runs on the same plant for 20 periods from rest.
     """)
+    return
 
 
 @app.cell
@@ -359,18 +382,20 @@ def _(mo):
     its parameter $g$ **and** in its initial state $z_0$, because the gradient flows through the
     state from one step to the next. leap-c provides $\partial u_0/\partial g$ and
     $\partial u_0/\partial z_0$ from the implicit function theorem on the KKT conditions of the
-    converged QP, reusing HPIPM's factorisation (Frey et al. 2025).
+    converged QP, reusing HPIPM's factorisation (Frey et al. 2026).
 
     **Is it really differentiable?** Roll the policy out for 20 steps on 4 plants, sum the
     energy, and compare the gradient with respect to $g$ from autograd with central finite
     differences. Half of the initial states sit near the stroke limit so that constraints are
     active along the way.
     """)
+    return
 
 
 @app.cell
 def _(MpcPolicy, mpc, plant, test_rollout_gradient):
     test_rollout_gradient(MpcPolicy(mpc), plant)
+    return
 
 
 @app.cell(hide_code=True)
@@ -407,8 +432,7 @@ def _(mo):
     it, that is, a smaller excitation gain. That stored energy $\Phi$ is known, so only the
     rest of the value is learned, by a critic $V_\phi$: a small MLP on the scaled state
     $s = (z, w)$. This matters because the actor sees the value only through its slope at
-    $s_h$, which a critic fitted to values gets only roughly; an underestimated slope is the
-    truncation bias again and pulls the gain down. The critic is fitted by regression to
+    $s_h$, which a critic fitted to values gets only roughly. The critic is fitted by regression to
     TD($\lambda$) returns of the same rollouts with the shaped rewards
     $r_t' = r_t + \gamma\,\Phi(s_{t+1}) - \Phi(s_t)$,
 
@@ -428,13 +452,16 @@ def _(mo):
     `ShacConfig` in `utils.py` collects the settings. Complete `reward`, `td_lambda_targets` and
     the two marked lines of `train`, then read the loop: it is the whole pipeline.
     """)
+    return
 
 
 @app.cell
 def _(REWARD_SCALE, p, torch):
     def reward(energy, x_next, cfg):
         """Electrical energy of the step minus the stroke-violation penalty, in units of REWARD_SCALE. All (B,)."""
-        return ...  # TODO: energy minus the quadratic penalty on |x_next| beyond cfg.x_max, in units of REWARD_SCALE.
+        return (
+            energy - cfg.viol_weight * torch.relu(x_next.abs() - cfg.x_max) ** 2
+        ) / REWARD_SCALE
 
     def stored_energy(obs):
         """Phi: the energy stored in the moving buoy, 1/2 k x^2 + 1/2 M v^2, in units of REWARD_SCALE. obs: (..., 4)."""
@@ -453,6 +480,7 @@ def _(ShacConfig, reward, torch):
             torch.tensor([1e5, 1e5]), torch.tensor([1.0, 1.6]), ShacConfig(x_max=1.5)
         ),
     )
+    return
 
 
 @app.cell
@@ -462,7 +490,7 @@ def _(torch):
         G, targets = v_next[-1], []
         for t in reversed(range(len(R))):
             # Mix the one-step bootstrap and the lambda-return.
-            G = ...  # TODO: the TD(lambda) recursion of the formula above.
+            G = R[t] + gamma * ((1 - lam) * v_next[t] + lam * G)
             targets.append(G)
         return torch.stack(targets[::-1])
 
@@ -480,6 +508,7 @@ def _(td_lambda_targets, torch):
             lam=0.5,
         ),
     )
+    return
 
 
 @app.cell
@@ -517,7 +546,7 @@ def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
             if steps >= cfg.episode_len:
                 obs, steps = restart(), 0
             # The window starts here: the graph of earlier steps is cut.
-            obs = ...  # TODO: cut the graph at the window boundary (truncation).
+            obs = obs.detach()
             obs_log, rews, ret, failed = [], [], 0.0, 0
             for t in range(
                 cfg.horizon
@@ -530,7 +559,9 @@ def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
                 ret = ret + cfg.gamma**t * rews[-1]
             obs_log.append(obs / scale)
             # Bootstrap with the value of the last obs: stored energy plus target critic.
-            ret = ret + ...  # TODO: gamma^h * (Phi + target critic) of the last obs.
+            ret = ret + cfg.gamma**cfg.horizon * (
+                stored_energy(obs) + target(obs_log[-1]).squeeze(-1)
+            )
             loss = -ret.mean() / cfg.horizon
             steps += cfg.horizon
             if it >= 0:  # warm-up iterations train the critic only
@@ -562,15 +593,15 @@ def _(deepcopy, nn, np, reward, stored_energy, td_lambda_targets, torch):
 
             if it < 0:
                 continue
-            entry = dict(
-                it=it + 1,
-                env_steps=(cfg.critic_warmup + it + 1) * cfg.horizon * cfg.n_env,
-                loss=loss.item(),
-                grad_norm=grad_norm,
-                critic_loss=critic_loss,
-                solver_failures=failed,
-                mean_reward=torch.stack(rews).mean().item(),
-            )
+            entry = {
+                "it": it + 1,
+                "env_steps": (cfg.critic_warmup + it + 1) * cfg.horizon * cfg.n_env,
+                "loss": loss.item(),
+                "grad_norm": grad_norm,
+                "critic_loss": critic_loss,
+                "solver_failures": failed,
+                "mean_reward": torch.stack(rews).mean().item(),
+            }
             if callback is not None:
                 entry.update(callback(it + 1, policy))
             log.append(entry)
@@ -586,6 +617,7 @@ def _(mo):
     50 critic warm-up iterations and 150 actor updates. Every 10 iterations the MPC is evaluated
     with the closed loop of Section 3. About 20 s on a laptop CPU.
     """)
+    return
 
 
 @app.cell
@@ -623,6 +655,7 @@ def _(mo):
     Steady-state power of every controller on the plant, and how much of the gap between the
     nominal MPC and the oracle the training recovers.
     """)
+    return
 
 
 @app.cell
@@ -649,6 +682,7 @@ def _(G_TRUE, ev, mo, polar, result_table, shac_log):
         result_table(_rows, _nom["power"], _orc["power"])
         + "\n\n(expected: SHAC about 33.5 kW, nearly all of the gap)"
     )
+    return
 
 
 @app.cell
@@ -659,6 +693,7 @@ def _(G_TRUE, ev, plot_training, shac_log):
         ev["MPC, true model (oracle)"]["power"],
         G_TRUE,
     )
+    return
 
 
 @app.cell
@@ -673,6 +708,12 @@ def _(U_MAX, X_MAX, ev, evaluate, plant, plot_closed_loop, pol_shac):
         U_MAX,
         plant.n_per,
     )
+    return
+
+
+@app.cell
+def _():
+    return
 
 
 if __name__ == "__main__":
